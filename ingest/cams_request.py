@@ -168,6 +168,19 @@ def submit_cas_request(page: Page, cfg: dict) -> None:
     page.wait_for_timeout(2000)
     dump_debug(page, "after_submit")
 
+    if response.status >= 400:
+        try:
+            body = response.text()
+        except Exception:
+            body = ""
+        snippet = (body or "").strip().replace("\n", " ")[:200]
+        suffix = f" — response: {snippet}" if snippet else ""
+        raise RuntimeError(
+            f"CAMS rejected the request (HTTP {response.status}). "
+            f"This is usually a CAMS-side rate limit or transient error — "
+            f"wait a few minutes and retry.{suffix}"
+        )
+
 
 def submit_via_playwright(force: bool = False, headless: bool | None = None) -> dict:
     """Run the full CAMS form submission and return a status dict.

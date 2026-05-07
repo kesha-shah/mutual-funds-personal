@@ -774,15 +774,68 @@ def main() -> None:
 
         if st.button("🔄 Refresh CAS", use_container_width=True,
                      help="Submit a fresh CAS request to CAMS. They'll email the PDF in 5-30 minutes."):
+            from ingest.cams_request import submit_via_playwright
+            from ingest.gmail_fetch import (
+                fetch_latest_cas,
+                load_config as _gmail_cfg,
+                peek_latest_uid,
+            )
+            import time
+
+            gmail_cfg = _gmail_cfg()
+            try:
+                baseline_uid = peek_latest_uid(gmail_cfg)
+            except Exception:
+                baseline_uid = None
+
             with st.spinner("Submitting CAS request to CAMS… (~30s)"):
-                from ingest.cams_request import submit_via_playwright
                 result = submit_via_playwright(force=True, headless=True)
-            if result.get("ok") and result.get("submitted"):
-                update_state(last_request_at=datetime.now().isoformat())
-                st.toast("✅ Submitted to CAMS — check inbox in a few minutes.", icon="📨")
-                st.rerun()
-            else:
+
+            if not (result.get("ok") and result.get("submitted")):
                 st.error(f"Submission failed: {result.get('error', 'unknown')}")
+            else:
+                update_state(last_request_at=datetime.now().isoformat())
+                st.toast("✅ Submitted to CAMS — waiting for email.", icon="📨")
+
+                poll_seconds = 600
+                interval = 30
+                deadline = time.time() + poll_seconds
+                progress = st.progress(0.0, text="Waiting for CAMS email…")
+                arrived_path = None
+                while time.time() < deadline:
+                    elapsed = poll_seconds - (deadline - time.time())
+                    mins, secs = divmod(int(elapsed), 60)
+                    progress.progress(
+                        min(elapsed / poll_seconds, 1.0),
+                        text=f"Waiting for CAMS email… {mins}m {secs:02d}s elapsed",
+                    )
+                    time.sleep(interval)
+                    try:
+                        new_uid = peek_latest_uid(gmail_cfg)
+                    except Exception:
+                        continue
+                    if new_uid and new_uid != baseline_uid:
+                        try:
+                            arrived_path = fetch_latest_cas(gmail_cfg)
+                        except Exception as e:
+                            st.error(f"Email arrived but fetch failed: {e}")
+                        break
+                progress.empty()
+
+                if arrived_path is not None:
+                    update_state(
+                        last_fetched_pdf=str(arrived_path),
+                        last_fetched_at=datetime.now().isoformat(),
+                    )
+                    load.clear()
+                    cached_nav.clear()
+                    st.success(f"✅ Got new CAS: {arrived_path.name}")
+                    st.rerun()
+                else:
+                    st.warning(
+                        "⏳ Email hasn't arrived after 10 minutes. CAMS sometimes "
+                        "takes longer — click **Process inbox** once it lands."
+                    )
 
         if st.button("📥 Process inbox", use_container_width=True,
                      help="Look for the latest CAMS email, download the PDF, and refresh the dashboard."):

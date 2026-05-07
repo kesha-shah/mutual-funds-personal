@@ -33,6 +33,33 @@ class NoNewCasError(RuntimeError):
     """Raised when no matching CAMS email is found."""
 
 
+def peek_latest_uid(cfg: dict) -> str | None:
+    """Return the IMAP UID of the latest matching CAMS email, without downloading.
+
+    Used to detect a fresh CAS arrival: capture the UID before submitting a
+    request, then poll until peek_latest_uid returns a different value.
+    """
+    g = cfg["gmail"]
+    host = g.get("imap_host", "imap.gmail.com")
+    port = int(g.get("imap_port", 993))
+    user = g["email"]
+    password = g["app_password"].replace(" ", "")
+    sender = g.get("cams_sender", "donotreply@camsonline.com")
+    subject = g.get("cams_subject", "CAMS Mailback Request")
+
+    with imaplib.IMAP4_SSL(host, port) as imap:
+        imap.login(user, password)
+        imap.select("INBOX")
+        criteria = f'(FROM "{sender}" SUBJECT "{subject}")'
+        status, data = imap.search(None, criteria)
+        if status != "OK":
+            return None
+        ids = data[0].split()
+        if not ids:
+            return None
+        return ids[-1].decode()
+
+
 def fetch_latest_cas(cfg: dict) -> Path:
     g = cfg["gmail"]
     host = g.get("imap_host", "imap.gmail.com")
