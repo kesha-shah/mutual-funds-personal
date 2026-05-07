@@ -1,0 +1,16 @@
+cams:
+  email: you@example.com         # email registered in your MF folios
+  pdf_password: ChooseAStrongOne  # this will encrypt the CAS PDF emailed to you
+  from_date: 2014-01-01           # YYYY-MM-DD; statement period start
+  to_date: today                  # YYYY-MM-DD or the literal "today"
+  dry_run: true                   # true = fill the form but DO NOT click Submit
+
+gmail:
+  email: you@example.com                  # inbox to watch (usually same as cams.email)
+  app_password: "xxxx xxxx xxxx xxxx"     # myaccount.google.com/apppasswords
+  cams_sender: donotreply@camsonline.com
+  cams_subject: "CAMS Mailback Request"
+
+playwright:
+  headless: false                 # set true once selectors are stable
+  slow_mo_ms: 250                 # 0 for normal speed; 250 helps see what's happening

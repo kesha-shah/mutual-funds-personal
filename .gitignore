@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+config.yaml
+*.pdf
+*.sqlite
+*.db
+.env
+.DS_Store
+debug/
+data/
+.claude/
+*.pkl
