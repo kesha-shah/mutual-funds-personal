@@ -917,6 +917,20 @@ def main() -> None:
 
     type_filtered = filter_rows(rows, type_filter)
 
+    # AMC filter — multi-select across whatever AMCs exist in the asset-class
+    # filtered subset. Empty selection = include all.
+    all_amcs = sorted({r.amc for r in type_filtered if r.amc})
+    selected_amcs = st.multiselect(
+        "AMC",
+        options=all_amcs,
+        default=[],
+        placeholder="All AMCs",
+        key=f"amc_filter_{type_filter}",
+        help="Filter by Asset Management Company. Leave empty to include all.",
+    )
+    if selected_amcs:
+        type_filtered = [r for r in type_filtered if r.amc in selected_amcs]
+
     # Sub-category options: in Total view we also surface sub-types that exist
     # only among redeemed schemes (current_value == 0).
     available_subs = sorted({
