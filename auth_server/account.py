@@ -95,6 +95,24 @@ def set_pdf_password(request: Request, slug: str, pdf_password: str = Form(...))
     return _back_to_dashboard("pdf-pw-saved")
 
 
+@router.post("/account/link")
+def link_account_post(
+    request: Request,
+    target_email: str = Form(...),
+    target_password: str = Form(...),
+):
+    """Submitted by the inline sidebar form. Streamlit reads the redirect
+    Location header to decide success/error without ever following it."""
+    sess = _require_session(request)
+    if sess is None:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        auth.link_existing_account(sess, target_email, target_password)
+    except (ValueError, PermissionError) as e:
+        return _back_to_dashboard(f"err-{e}")
+    return _back_to_dashboard("linked")
+
+
 @router.api_route("/account/{slug}/unlink", methods=["GET", "POST"])
 def unlink(request: Request, slug: str):
     sess = _require_session(request)

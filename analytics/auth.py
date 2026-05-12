@@ -27,6 +27,7 @@ from pathlib import Path
 import yaml
 
 from analytics import crypto, db
+from analytics.crypto import InvalidToken
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.yaml"
@@ -312,6 +313,65 @@ def accept_invite(token: str, password: str) -> tuple[str, Session]:
 # Linking
 # ---------------------------------------------------------------------------
 
+def link_existing_account(session: Session, target_email: str, target_password: str) -> str:
+    """Grant ``session.user`` access to the CAS account owned by ``target_email``
+    by entering target's login password. Returns the slug they now have access to.
+
+    Verifies target's password → derives target's KEK → unwraps the data key →
+    re-wraps it with the requester's KEK and persists an account_access row.
+    Target keeps their own access; this is additive."""
+    target_email = _norm_email(target_email)
+    if target_email == session.user_email:
+        raise ValueError("You already have access to your own account.")
+    target = get_user(target_email)
+    if not target:
+        raise ValueError(
+            f"No account exists for {target_email}. Ask the admin to invite "
+            f"them first — they need to accept the invite and sign up before "
+            f"you can link to their account."
+        )
+    if not crypto.verify_password(target["password_hash"], target_password):
+        raise ValueError(f"Wrong password for {target_email}.")
+
+    owned = db.fetchone(
+        "SELECT account_slug, wrapped_data_key FROM account_access "
+        "WHERE user_email = ? AND is_owner = 1",
+        (target_email,),
+    )
+    if not owned:
+        raise ValueError(
+            f"{target_email} signed up but hasn't set up a CAS account yet. "
+            f"Ask them to finish setup (Gmail App Password + PDF password) first."
+        )
+
+    target_kek = crypto.derive_kek(target_password, target["kek_salt"])
+    try:
+        data_key = crypto.unwrap_key(owned["wrapped_data_key"], target_kek)
+    except InvalidToken:
+        raise ValueError("Could not unwrap target account's key (password mismatch).")
+
+    slug = owned["account_slug"]
+    wrapped = crypto.wrap_key(data_key, session.kek)
+    existing = db.fetchone(
+        "SELECT 1 FROM account_access WHERE user_email = ? AND account_slug = ?",
+        (session.user_email, slug),
+    )
+    if existing:
+        db.execute(
+            "UPDATE account_access SET wrapped_data_key = ?, granted_at = ? "
+            "WHERE user_email = ? AND account_slug = ?",
+            (wrapped, _now(), session.user_email, slug),
+        )
+    else:
+        db.execute(
+            "INSERT INTO account_access (user_email, account_slug, wrapped_data_key, is_owner, granted_at) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (session.user_email, slug, wrapped, _now()),
+        )
+    session.data_keys[slug] = data_key
+    return slug
+
+
 def unlink_account(session: Session, slug: str) -> None:
     """Remove the current user's access to a linked account. Refuses to unlink
     an account the user owns — use delete_my_account for that."""
@@ -487,6 +547,7 @@ __all__ = [
     "get_invite",
     "get_session",
     "get_user",
+    "link_existing_account",
     "login",
     "needs_setup",
     "register_admin",

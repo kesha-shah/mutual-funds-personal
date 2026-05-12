@@ -17,8 +17,16 @@ from typing import Callable
 
 import streamlit as st
 
+import httpx
+
 from analytics import auth
 from ui.auth_glue import active_slug
+
+
+# The Streamlit dashboard always sits behind the FastAPI gateway on the same
+# host; the link form just relays to the gateway endpoint over loopback so
+# auth_server (which holds the KEK) can do the actual key-unwrap work.
+_GATEWAY_URL = "http://127.0.0.1:8000"
 
 
 def render_account_picker(session: auth.Session, on_account_change: Callable[[], None]) -> str | None:
@@ -39,6 +47,8 @@ def render_account_picker(session: auth.Session, on_account_change: Callable[[],
         format_func=lambda s: label_for.get(s, s),
         key="acc_picker",
     )
+    _render_link_expander()
+
     if chosen != active:
         st.session_state["_active_slug"] = chosen
         st.query_params["account"] = chosen
@@ -53,6 +63,92 @@ def render_account_picker(session: auth.Session, on_account_change: Callable[[],
     own_slug = auth.slugify(session.user_email)
     _render_settings_expander(session, chosen, is_owner=chosen == own_slug)
     return chosen
+
+
+def _render_link_expander() -> None:
+    """Inline form: enter another user's email + login password and submit
+    without leaving the dashboard. Streamlit calls the gateway over loopback,
+    forwarding the user's auth cookie so the gateway resolves the right
+    Session (and its KEK) for the link operation."""
+    # Auto-open the expander while we're showing the success state so the
+    # user sees the linked-email confirmation immediately on rerun.
+    just_linked = st.session_state.get("_just_linked")
+    with st.expander("➕ Link another account", expanded=bool(just_linked)):
+        if just_linked:
+            st.success(f"Linked **{just_linked}**.")
+            st.caption(
+                "Refresh the dashboard to see them in the account dropdown — "
+                "the session needs a fresh handshake to pick up the new account."
+            )
+            st.link_button("🔄 Refresh dashboard", "/", type="primary",
+                           use_container_width=True)
+            if st.button("Link another account", use_container_width=True,
+                         key="link_another"):
+                del st.session_state["_just_linked"]
+                st.rerun()
+            return
+
+        # Streamlit shows a "Press Enter to submit form" hint under every
+        # text_input inside a form. Hide it — clutters the small sidebar.
+        st.markdown(
+            "<style>[data-testid='InputInstructions']{display:none!important;}</style>",
+            unsafe_allow_html=True,
+        )
+        with st.form("link_account_form", clear_on_submit=True):
+            email = st.text_input("Account email", autocomplete="off")
+            password = st.text_input(
+                "Account login password", type="password", autocomplete="off",
+                help="Used once to unlock their CAS data; never stored.",
+            )
+            submit = st.form_submit_button("Link account", type="primary",
+                                            use_container_width=True)
+
+        if not submit:
+            return
+        if not email.strip() or not password:
+            st.error("Both email and password are required.")
+            return
+
+        # Forward cookies as a raw Cookie header — bypasses any httpx cookie-jar
+        # domain matching that would drop a cookie set for a different host
+        # (e.g. when the dashboard is accessed via LAN IP but Streamlit calls
+        # the gateway over loopback).
+        cookies = dict(st.context.cookies or {})
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+        try:
+            resp = httpx.post(
+                f"{_GATEWAY_URL}/account/link",
+                data={"target_email": email.strip(), "target_password": password},
+                headers={"Cookie": cookie_header} if cookie_header else {},
+                follow_redirects=False,
+                timeout=10.0,
+            )
+        except Exception as e:
+            st.error(f"Couldn't reach the auth gateway: {e}")
+            return
+
+        # Gateway always 303-redirects: success → /?flash=linked,
+        # validation failure → /?flash=err-<msg>, no session → /login.
+        from urllib.parse import unquote
+        location = resp.headers.get("location", "")
+        if "flash=linked" in location:
+            # Stash the linked email so the next rerun renders a clear
+            # success panel + refresh prompt instead of a cleared form.
+            st.session_state["_just_linked"] = email.strip()
+            st.rerun()
+        elif "flash=err-" in location:
+            err = unquote(location.split("flash=err-", 1)[1])
+            st.error(err)
+        elif location.startswith("/login"):
+            cookie_names = list(cookies.keys()) or "(none)"
+            st.error(
+                f"Gateway didn't recognise your session (cookies forwarded: "
+                f"{cookie_names}). Reload the dashboard page and log in again."
+            )
+        else:
+            st.error(f"Unexpected gateway response (HTTP {resp.status_code}, "
+                     f"location={location!r}).")
 
 
 def _render_invite_expander(session: auth.Session) -> None:

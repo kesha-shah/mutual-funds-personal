@@ -92,10 +92,23 @@ async def proxy_websocket(websocket: WebSocket, payload: str) -> None:
     )
     requested_subprotocols = websocket.scope.get("subprotocols") or []
 
+    # Forward client headers (notably Cookie) so st.context.cookies and
+    # st.context.headers see the same values the dashboard would see for an
+    # HTTP request. Skip hop-by-hop and websocket-control headers, which the
+    # underlying websockets library sets itself.
+    _WS_RESERVED = {"host", "upgrade", "connection", "origin"}
+    forwarded_headers: list[tuple[str, str]] = []
+    for k, v in websocket.headers.items():
+        lk = k.lower()
+        if lk in _HOP_BY_HOP or lk in _WS_RESERVED or lk.startswith("sec-websocket"):
+            continue
+        forwarded_headers.append((k, v))
+    forwarded_headers.append((SESSION_HEADER, payload))
+
     try:
         upstream = await websockets.connect(
             upstream_url,
-            additional_headers=[(SESSION_HEADER, payload)],
+            additional_headers=forwarded_headers,
             subprotocols=requested_subprotocols or None,
         )
     except Exception as e:
