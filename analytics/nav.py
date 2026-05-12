@@ -30,16 +30,12 @@ def _fetch_amfi() -> dict[str, tuple[float, str]]:
             continue
         _code = parts[0]
         isin_div, isin_growth = parts[1], parts[2]
-        nav_str, nav_date_str = parts[4], parts[5]
-        nav_str = nav_str.strip()
+        nav_str, nav_date_str = parts[4].strip(), parts[5].strip()
         if not nav_str or nav_str.upper() in {"N.A.", "NA", "-"}:
             continue
         try:
             nav_val = float(nav_str)
-        except ValueError:
-            continue
-        try:
-            d = datetime.strptime(nav_date_str.strip(), "%d-%b-%Y").date()
+            d = datetime.strptime(nav_date_str, "%d-%b-%Y").date()
         except ValueError:
             continue
         for isin in (isin_div.strip(), isin_growth.strip()):

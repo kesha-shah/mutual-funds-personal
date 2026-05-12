@@ -1,8 +1,10 @@
 """
 Fetch the latest CAS PDF from Gmail via IMAP.
 
-Connects with an App Password, finds the most recent message matching the
-configured CAMS sender + subject, and writes the PDF attachment to data/cas/.
+Connects with the account's Gmail App Password, finds the most recent message
+matching CAMS sender + subject, and writes the (still-password-protected)
+PDF attachment to data/accounts/<slug>/cas/*.pdf.enc — AES-encrypted with
+the account's data key so the bytes can't be cat'd off disk without a login.
 """
 from __future__ import annotations
 
@@ -12,17 +14,10 @@ import re
 from email import policy
 from pathlib import Path
 
-from analytics.accounts import account_data_dir, load_config as _load_config
+from analytics import crypto
+from analytics.accounts import AccountContext, app_config
 
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def cas_dir() -> Path:
-    return account_data_dir() / "cas"
-
-
-def load_config() -> dict:
-    return _load_config()
 
 
 def _safe_filename(name: str) -> str:
@@ -33,24 +28,23 @@ class NoNewCasError(RuntimeError):
     """Raised when no matching CAMS email is found."""
 
 
-def peek_latest_uid(cfg: dict) -> str | None:
-    """Return the IMAP UID of the latest matching CAMS email, without downloading.
+def _imap_params(ctx: AccountContext) -> tuple[str, int, str, str, str]:
+    cfg = app_config()
+    return (
+        cfg["imap_host"],
+        cfg["imap_port"],
+        ctx.email,
+        ctx.app_password,
+        f'(FROM "{cfg["cams_sender"]}" SUBJECT "{cfg["cams_subject"]}")',
+    )
 
-    Used to detect a fresh CAS arrival: capture the UID before submitting a
-    request, then poll until peek_latest_uid returns a different value.
-    """
-    g = cfg["gmail"]
-    host = g.get("imap_host", "imap.gmail.com")
-    port = int(g.get("imap_port", 993))
-    user = g["email"]
-    password = g["app_password"].replace(" ", "")
-    sender = g.get("cams_sender", "donotreply@camsonline.com")
-    subject = g.get("cams_subject", "CAMS Mailback Request")
 
+def peek_latest_uid(ctx: AccountContext) -> str | None:
+    """Latest matching IMAP UID without downloading — used to detect new arrivals."""
+    host, port, user, password, criteria = _imap_params(ctx)
     with imaplib.IMAP4_SSL(host, port) as imap:
         imap.login(user, password)
         imap.select("INBOX")
-        criteria = f'(FROM "{sender}" SUBJECT "{subject}")'
         status, data = imap.search(None, criteria)
         if status != "OK":
             return None
@@ -60,21 +54,21 @@ def peek_latest_uid(cfg: dict) -> str | None:
         return ids[-1].decode()
 
 
-def fetch_latest_cas(cfg: dict) -> Path:
-    g = cfg["gmail"]
-    host = g.get("imap_host", "imap.gmail.com")
-    port = int(g.get("imap_port", 993))
-    user = g["email"]
-    password = g["app_password"].replace(" ", "")
-    sender = g.get("cams_sender", "donotreply@camsonline.com")
-    subject = g.get("cams_subject", "CAMS Mailback Request")
+def fetch_latest_cas(ctx: AccountContext, since_uid: str | None = None) -> Path:
+    """Download the latest CAMS PDF and write it encrypted to ctx.cas_dir.
+    Returns the on-disk .pdf.enc path.
 
+    If ``since_uid`` is provided, only emails whose IMAP UID is strictly greater
+    than this baseline are eligible — guards against picking up an older CAMS
+    email (from a previous run or a different sender's old request) that
+    happens to still sit in the inbox encrypted with a different password.
+    """
+    host, port, user, password, criteria = _imap_params(ctx)
     print(f"-> connecting to {host}:{port} as {user}")
     with imaplib.IMAP4_SSL(host, port) as imap:
         imap.login(user, password)
         imap.select("INBOX")
 
-        criteria = f'(FROM "{sender}" SUBJECT "{subject}")'
         print(f"-> searching: {criteria}")
         status, data = imap.search(None, criteria)
         if status != "OK":
@@ -83,6 +77,18 @@ def fetch_latest_cas(cfg: dict) -> Path:
         ids = data[0].split()
         if not ids:
             raise NoNewCasError("No matching CAMS emails found in INBOX.")
+
+        if since_uid is not None:
+            try:
+                baseline = int(since_uid)
+                ids = [i for i in ids if int(i) > baseline]
+            except ValueError:
+                pass
+            if not ids:
+                raise NoNewCasError(
+                    f"No CAMS emails newer than UID {since_uid} — "
+                    "the most recent request may still be in transit."
+                )
 
         latest_id = ids[-1]
         print(f"-> {len(ids)} match(es); using latest UID {latest_id.decode()}")
@@ -107,22 +113,14 @@ def fetch_latest_cas(cfg: dict) -> Path:
             raise RuntimeError("No PDF attachment found in the latest CAMS email.")
 
         attachment_name = pdf_part.get_filename() or f"cas_{latest_id.decode()}.pdf"
-        out_name = f"{latest_id.decode()}_{_safe_filename(attachment_name)}"
-        target_dir = cas_dir()
-        target_dir.mkdir(parents=True, exist_ok=True)
+        out_name = f"{latest_id.decode()}_{_safe_filename(attachment_name)}.enc"
+        target_dir = ctx.cas_dir
         out_path = target_dir / out_name
         if out_path.exists():
             print(f"-> already on disk: {out_path}")
             return out_path
-        out_path.write_bytes(pdf_part.get_payload(decode=True))
-        print(f"-> saved {out_path} ({out_path.stat().st_size:,} bytes)")
+        pdf_bytes = pdf_part.get_payload(decode=True)
+        encrypted = crypto.encrypt_bytes(pdf_bytes, ctx.data_key)
+        out_path.write_bytes(encrypted)
+        print(f"-> saved {out_path} ({out_path.stat().st_size:,} bytes encrypted)")
         return out_path
-
-
-def main() -> None:
-    cfg = load_config()
-    fetch_latest_cas(cfg)
-
-
-if __name__ == "__main__":
-    main()

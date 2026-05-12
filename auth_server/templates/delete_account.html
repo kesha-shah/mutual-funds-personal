@@ -1,0 +1,28 @@
+{% extends "_base.html" %}
+{% block title %}Delete account · Mutual Fund Portfolio{% endblock %}
+{% block content %}
+  <p><a href="/" class="back-link">← Back to dashboard</a></p>
+
+  <h1>Delete my account</h1>
+
+  <div class="info" style="border-left-color:#ef4444;background:rgba(239,68,68,0.10);color:#fca5a5;">
+    <strong>This cannot be undone.</strong> Deleting your account will:
+    <ul style="margin:8px 0 0;">
+      <li>Remove your user record</li>
+      <li>Delete every CAS account you own</li>
+      <li>Wipe every encrypted PDF and parsed cache file on disk</li>
+      <li>Sign you out everywhere</li>
+    </ul>
+  </div>
+
+  {% if flash and flash.startswith("err-") %}
+    <div class="error">{{ flash[4:] }}</div>
+  {% endif %}
+
+  <form method="post" action="/account/delete">
+    <label>Type your password to confirm
+      <input type="password" name="password" required autofocus>
+    </label>
+    <button type="submit" class="danger">Delete everything</button>
+  </form>
+{% endblock %}

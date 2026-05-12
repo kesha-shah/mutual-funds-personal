@@ -1,2 +1,16 @@
-[client]
-toolbarMode = "minimal"
+# Streamlit settings for this project.
+# Loaded automatically from this path on `streamlit run`.
+
+[browser]
+# Disable Streamlit's usage telemetry. Those calls to segment.io / fivetran
+# webhooks you saw in the Network tab come from here.
+gatherUsageStats = false
+
+[server]
+# We always run behind the FastAPI auth gateway, which strips/replaces these
+# protections. Setting them at the config level means the run command stays
+# clean.
+enableXsrfProtection = false
+enableCORS = false
+headless = true
+port = 8501

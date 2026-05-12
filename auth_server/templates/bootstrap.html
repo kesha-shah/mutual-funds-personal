@@ -1,0 +1,24 @@
+{% extends "_base.html" %}
+{% block title %}First-time setup · Mutual Fund Portfolio{% endblock %}
+{% block content %}
+  <h1>First-time setup</h1>
+  <p class="muted">
+    No users exist yet. Create the admin account for
+    <strong>{{ admin_email }}</strong>. You'll connect Gmail on the next step.
+  </p>
+
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  <form method="post" action="/bootstrap">
+    <label>Email
+      <input type="email" value="{{ admin_email }}" disabled>
+    </label>
+    <label>Choose a password
+      <input type="password" name="password" autocomplete="new-password" required minlength="6" autofocus>
+    </label>
+    <label>Confirm password
+      <input type="password" name="confirm" autocomplete="new-password" required>
+    </label>
+    <button type="submit">Create admin</button>
+  </form>
+{% endblock %}

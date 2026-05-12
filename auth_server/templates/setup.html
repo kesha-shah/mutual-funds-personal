@@ -1,0 +1,61 @@
+{% extends "_base.html" %}
+{% block title %}Set up · Mutual Fund Portfolio{% endblock %}
+{% block content %}
+  <h1>Set up your account</h1>
+  <p class="muted">
+    Almost there, <strong>{{ email }}</strong>. Two passwords to set up.
+  </p>
+
+  <h2>1. Gmail App Password</h2>
+
+  <div class="info">
+    <strong>Privacy:</strong> this app only reads CAMS statement emails
+    (<code>donotreply@camsonline.com</code>). Never your other emails, never
+    outgoing mail, never anything else.
+  </div>
+
+  <div class="info" style="border-left-color:#f59e0b;background:rgba(245,158,11,0.10);">
+    <strong>This is NOT your regular Gmail password.</strong> Google issues a
+    separate 16-character <em>App Password</em> for apps that read mail —
+    that's what you need below.
+  </div>
+
+  <p><strong>What you'll do — read all 3 first:</strong></p>
+  <ol>
+    <li>App name on Google's form: <code>MF Portfolio</code> (any name works).</li>
+    <li>Click <strong>Create</strong>. Google shows a 16-character password.</li>
+    <li><strong>Copy it, come back to this tab, and paste it below.</strong> Spaces are stripped.</li>
+  </ol>
+  <p>
+    Then open <a href="https://myaccount.google.com/apppasswords" target="_blank">myaccount.google.com/apppasswords</a>
+    in a new tab and follow the steps above.
+  </p>
+  <p class="muted">Stored encrypted on this machine. Never synced.</p>
+
+  <h2>2. CAS PDF password</h2>
+  <p>CAMS encrypts the statement PDFs they email you with this password. Pick anything that meets:</p>
+  <ul>
+    <li>6–15 characters</li>
+    <li>At least one <strong>uppercase</strong>, one <strong>lowercase</strong>, one <strong>digit</strong></li>
+    <li>Letters, digits, and <code>@</code> only — CAMS rejects other symbols</li>
+  </ul>
+  <p class="muted">Example: <code>Funds2025</code></p>
+
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  <form method="post" action="/setup">
+    <label>Gmail App Password
+      <input type="password" name="app_password" required>
+    </label>
+    <label>CAS PDF password
+      <input type="password" name="pdf_password" required minlength="6" maxlength="15">
+    </label>
+    <label>Confirm PDF password
+      <input type="password" name="pdf_password_confirm" required>
+    </label>
+    <label>Fetch CAS statements starting from
+      <input type="date" name="from_date" value="{{ from_date }}" required>
+    </label>
+    <button type="submit">Save &amp; go to dashboard</button>
+  </form>
+{% endblock %}

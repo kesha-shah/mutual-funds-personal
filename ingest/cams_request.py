@@ -3,30 +3,24 @@ Submit the CAMS Consolidated Account Statement (CAS) request form.
 
 The CAS PDF is emailed to the address registered in your MF folios.
 This script only fills and submits the public form — no login involved.
+
+The form requires a "PDF password" the user picks; CAMS uses it to encrypt
+the emailed PDF. We default this to the account's login email (the user can
+override in Settings).
 """
 from __future__ import annotations
 
-import sys
 from datetime import date, datetime
 from pathlib import Path
 
-import yaml
 from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
 
+from analytics.accounts import AccountContext, app_config
+
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = ROOT / "config.yaml"
 DEBUG_DIR = ROOT / "debug"
 
 CAS_URL = "https://www.camsonline.com/Investors/Statements/Consolidated-Account-Statement"
-
-
-def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        sys.exit(
-            f"Missing {CONFIG_PATH}. Copy config.example.yaml to config.yaml and fill it in."
-        )
-    from analytics.accounts import load_config as _load
-    return _load()
 
 
 def dump_debug(page: Page, tag: str) -> None:
@@ -57,17 +51,14 @@ def dismiss_disclaimer(page: Page) -> None:
     try:
         page.wait_for_selector("text=Disclaimer", timeout=5000)
     except PWTimeout:
-        return  # no disclaimer (cookies already set in this context)
+        return
 
     print("-> Disclaimer modal detected; accepting")
-    # Click the radio's circle (.mat-radio-container) — clicking the label
-    # would hit the embedded "Terms" / "Privacy Policy" links instead.
     page.locator(
         'mat-radio-button:has(input[value="ACCEPT"]) .mat-radio-container'
     ).click()
     page.wait_for_timeout(300)
     page.get_by_role("button", name="PROCEED").click()
-    # Wait for the modal to disappear before continuing.
     try:
         page.wait_for_selector("text=Disclaimer", state="hidden", timeout=5000)
     except PWTimeout:
@@ -75,13 +66,11 @@ def dismiss_disclaimer(page: Page) -> None:
     page.wait_for_timeout(500)
 
 
-def submit_cas_request(page: Page, cfg: dict) -> None:
-    cams = cfg["cams"]
-    email = cams["email"]
-    pdf_password = cams["pdf_password"]
-    from_date = _coerce_date(cams["from_date"])
-    to_date = _coerce_date(cams["to_date"], fallback_today=True)
-    dry_run = bool(cams.get("dry_run", True))
+def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> None:
+    email = ctx.email
+    pdf_password = ctx.pdf_password
+    from_date = _coerce_date(ctx.from_date)
+    to_date = date.today()
 
     print(f"-> opening {CAS_URL}")
     page.goto(CAS_URL, wait_until="networkidle")
@@ -90,8 +79,6 @@ def submit_cas_request(page: Page, cfg: dict) -> None:
     dismiss_disclaimer(page)
     dump_debug(page, "02_after_cookie")
 
-    # CAMS embeds a chat widget (cdk-overlay-container) that intercepts clicks.
-    # Dismiss it if it auto-opened.
     for sel in ["button[aria-label='Close']", ".close-chat", "#chat-close"]:
         try:
             page.locator(sel).first.click(timeout=1500)
@@ -99,7 +86,6 @@ def submit_cas_request(page: Page, cfg: dict) -> None:
         except Exception:
             continue
 
-    # Tile grid: pick "CAS - CAMS+ KFintech" if not already active.
     tile = page.get_by_text("CAS - CAMS+ KFintech", exact=False).first
     if tile.is_visible():
         try:
@@ -114,13 +100,10 @@ def submit_cas_request(page: Page, cfg: dict) -> None:
     click_radio("detailed", "Detailed statement type")
     page.wait_for_timeout(800)
 
-    # Specific Period unlocks the From/To date inputs.
     click_radio("SP", "Specific Period")
     page.wait_for_timeout(800)
     dump_debug(page, "after_sp")
 
-    # Material datepicker inputs stay readonly even when enabled. Set the
-    # value via JS and fire Angular-friendly events so the FormControl picks it up.
     def fill_date(input_id: str, value: str, description: str) -> None:
         print(f"-> filling {description}: {value}")
         page.locator(f"input#{input_id}").evaluate(
@@ -151,7 +134,6 @@ def submit_cas_request(page: Page, cfg: dict) -> None:
 
     if dry_run:
         print("-> DRY RUN: form is filled but Submit will NOT be clicked.")
-        print("   Set cams.dry_run: false in config.yaml to actually submit.")
         page.wait_for_timeout(2000)
         return
 
@@ -164,40 +146,78 @@ def submit_cas_request(page: Page, cfg: dict) -> None:
 
     response = resp_info.value
     print(f"   API status: {response.status}")
-    # Give the UI a moment to render the success/failure dialog.
-    page.wait_for_timeout(2000)
+    try:
+        body = response.text() or ""
+    except Exception:
+        body = ""
+    page.wait_for_timeout(2500)
     dump_debug(page, "after_submit")
+    DEBUG_DIR.mkdir(exist_ok=True)
+    (DEBUG_DIR / "after_submit_response.txt").write_text(
+        f"HTTP {response.status}\n\n{body}"
+    )
+
+    snippet = body.strip().replace("\n", " ")[:300]
 
     if response.status >= 400:
-        try:
-            body = response.text()
-        except Exception:
-            body = ""
-        snippet = (body or "").strip().replace("\n", " ")[:200]
         suffix = f" — response: {snippet}" if snippet else ""
         raise RuntimeError(
             f"CAMS rejected the request (HTTP {response.status}). "
-            f"This is usually a CAMS-side rate limit or transient error — "
-            f"wait a few minutes and retry.{suffix}"
+            f"Usually a CAMS-side rate limit or transient error — wait and retry.{suffix}"
         )
 
+    # Strict success: require a positive signal, not just absence of failure.
+    # CAMS can return 200 on captcha block / silent rejection — we should NOT
+    # tell the user "submitted" unless we have actual confirmation.
+    body_lower = body.lower()
+    body_success_signals = (
+        '"success":true', '"status":"success"', '"status":"ok"',
+        "request has been", "email has been sent", "successfully submitted",
+        "request received", "request submitted",
+    )
+    has_body_success = any(s in body_lower for s in body_success_signals)
 
-def submit_via_playwright(force: bool = False, headless: bool | None = None) -> dict:
+    has_dom_success = False
+    if not has_body_success:
+        success_re = (
+            "/Thank you|request has been|email has been sent|"
+            "will be sent to|successfully submitted|received your request|"
+            "dispatched|sent to your registered/i"
+        )
+        try:
+            page.wait_for_selector(f"text={success_re}", timeout=8000)
+            has_dom_success = True
+        except PWTimeout:
+            pass
+
+    if not (has_body_success or has_dom_success):
+        raise RuntimeError(
+            "Couldn't submit the CAS request to CAMS this time. "
+            "Try clicking **Refresh CAS** again in a minute.\n\n"
+            "If this keeps happening, submit the form yourself here:\n"
+            f"  {CAS_URL}\n\n"
+            "Use the same CAS PDF password you've set in this app's settings — "
+            "otherwise the emailed PDF won't open here.\n\n"
+            "Once CAMS emails you the statement, come back and click "
+            "**Process inbox** to load it."
+        )
+    print(f"-> submit confirmed via {'API body' if has_body_success else 'page text'}")
+
+
+def submit_via_playwright(ctx: AccountContext, *, dry_run: bool = False, headless: bool | None = None) -> dict:
     """Run the full CAMS form submission and return a status dict.
 
     Parameters
     ----------
-    force : bool
-        If True, override config's ``cams.dry_run`` and actually click Submit.
-        Use this when invoking from the UI.
+    ctx : AccountContext
+        Which CAS account to submit for (provides email + PDF password).
+    dry_run : bool
+        Fill the form but don't click Submit. Default False.
     headless : bool | None
-        Override config's playwright.headless. None = use config.
+        Override the playwright.headless setting from config.yaml.
     """
-    cfg = load_config()
-    if force:
-        cfg = {**cfg, "cams": {**cfg["cams"], "dry_run": False}}
-    pw_cfg = cfg.get("playwright", {})
-    is_headless = pw_cfg.get("headless", False) if headless is None else headless
+    pw_cfg = app_config().get("playwright") or {}
+    is_headless = pw_cfg.get("headless", True) if headless is None else headless
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -210,22 +230,9 @@ def submit_via_playwright(force: bool = False, headless: bool | None = None) -> 
         )
         page = context.new_page()
         try:
-            submit_cas_request(page, cfg)
-            return {
-                "ok": True,
-                "submitted": not cfg["cams"].get("dry_run", True),
-            }
+            submit_cas_request(page, ctx, dry_run=dry_run)
+            return {"ok": True, "submitted": not dry_run}
         except Exception as e:
             return {"ok": False, "error": str(e)}
         finally:
             browser.close()
-
-
-def main() -> None:
-    result = submit_via_playwright()
-    if not result.get("ok"):
-        sys.exit(result.get("error") or "submission failed")
-
-
-if __name__ == "__main__":
-    main()

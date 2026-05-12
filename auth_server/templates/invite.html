@@ -1,0 +1,32 @@
+{% extends "_base.html" %}
+{% block title %}Accept invitation · Mutual Fund Portfolio{% endblock %}
+{% block content %}
+  {% if invalid %}
+    <h1>Invitation invalid</h1>
+    <div class="error">
+      This invite link is expired, already used, or unrecognized.
+      Ask the admin for a fresh one.
+    </div>
+  {% else %}
+    <h1>Welcome!</h1>
+    <p class="muted">
+      Setting up an account for <strong>{{ invitee_email }}</strong>.
+      You'll connect Gmail on the next step.
+    </p>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    <form method="post" action="/invite/{{ token }}">
+      <label>Choose a password
+        <small>You'll use this to log in. Forgetting it means your data
+               is unrecoverable — write it down.</small>
+        <input type="password" name="password" autocomplete="new-password"
+               required minlength="6" autofocus>
+      </label>
+      <label>Confirm password
+        <input type="password" name="confirm" autocomplete="new-password" required>
+      </label>
+      <button type="submit">Create account</button>
+    </form>
+  {% endif %}
+{% endblock %}

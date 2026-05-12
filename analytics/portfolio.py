@@ -4,7 +4,10 @@ helpers used by the Streamlit UI.
 """
 from __future__ import annotations
 
+import os
 import pickle
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -12,19 +15,12 @@ from typing import Iterable
 
 from casparser import read_cas_pdf
 
-from analytics.accounts import account_data_dir, load_config as _load_config
+from analytics import crypto
+from analytics.accounts import AccountContext
 from analytics.categorize import adjusted_type, subcategory
 from analytics.folio_names import extract_folio_names
 
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def cas_dir() -> Path:
-    return account_data_dir() / "cas"
-
-
-def parse_cache_path() -> Path:
-    return account_data_dir() / "parsed_cache.pkl"
 
 # Only include transactions that represent an actual investor cashflow (or its
 # scheme-level proxy). DIVIDEND_REINVEST does not move cash; the small TAX
@@ -89,45 +85,58 @@ class SchemeRow:
         return (self.gain / self.invested) if self.invested else 0.0
 
 
-def latest_pdf() -> Path:
-    d = cas_dir()
-    pdfs = sorted(d.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not pdfs:
-        raise FileNotFoundError(f"No PDFs in {d}. Run ingest.gmail_fetch first.")
-    return pdfs[0]
+def latest_pdf_enc(ctx: AccountContext) -> Path:
+    """Latest encrypted CAS file on disk for this account."""
+    d = ctx.cas_dir
+    files = sorted(d.glob("*.pdf.enc"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        raise FileNotFoundError(f"No CAS PDFs in {d}. Run CAS Refresh first.")
+    return files[0]
 
 
-def parse_cas(force: bool = False) -> dict:
-    """Parse the latest CAS PDF. Caches the parsed dict to disk so repeat
-    sessions don't re-run the (~30s) parser when the source PDF is unchanged.
-    Pass force=True to bypass the cache."""
-    cfg = _load_config()
-    pdf = latest_pdf()
-    pdf_size = pdf.stat().st_size
-    cache_path = parse_cache_path()
+@contextmanager
+def _decrypted_pdf(enc_path: Path, data_key: bytes):
+    """Decrypt the .pdf.enc into a private temp file, yield its path, then
+    securely delete the temp file. The decrypted PDF stays password-protected
+    (CAMS password) — we never write plaintext PDF content to disk."""
+    plaintext = crypto.decrypt_bytes(enc_path.read_bytes(), data_key)
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="cas_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(plaintext)
+        yield Path(tmp_path)
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def parse_cas(ctx: AccountContext, force: bool = False) -> dict:
+    """Parse the latest CAS PDF for this account. Caches the parsed dict
+    (encrypted) to disk so repeat sessions don't re-run the parser when the
+    source PDF is unchanged."""
+    enc_pdf = latest_pdf_enc(ctx)
+    pdf_size = enc_pdf.stat().st_size
+    cache_path = ctx.parse_cache_path
 
     if not force and cache_path.exists():
         try:
-            with open(cache_path, "rb") as f:
-                cache = pickle.load(f)
-            if cache.get("pdf_name") == pdf.name and cache.get("pdf_size") == pdf_size:
-                data = cache["data"]
-                # Older caches predate holder-name extraction; backfill once.
-                if "_folio_names" not in data:
-                    data["_folio_names"] = extract_folio_names(pdf, cfg["cams"]["pdf_password"])
-                    with open(cache_path, "wb") as f:
-                        pickle.dump({"pdf_name": pdf.name, "pdf_size": pdf_size, "data": data}, f)
-                return data
+            blob = crypto.decrypt_bytes(cache_path.read_bytes(), ctx.data_key)
+            cache = pickle.loads(blob)
+            if cache.get("pdf_name") == enc_pdf.name and cache.get("pdf_size") == pdf_size:
+                return cache["data"]
         except Exception:
-            pass  # fall through and re-parse
+            pass  # corrupted / wrong key / version mismatch — re-parse
 
-    raw = read_cas_pdf(str(pdf), cfg["cams"]["pdf_password"], output="dict")
-    data = raw.model_dump() if hasattr(raw, "model_dump") else raw
-    data["_folio_names"] = extract_folio_names(pdf, cfg["cams"]["pdf_password"])
+    with _decrypted_pdf(enc_pdf, ctx.data_key) as plain_pdf:
+        raw = read_cas_pdf(str(plain_pdf), ctx.pdf_password, output="dict")
+        data = raw.model_dump() if hasattr(raw, "model_dump") else raw
+        data["_folio_names"] = extract_folio_names(plain_pdf, ctx.pdf_password)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump({"pdf_name": pdf.name, "pdf_size": pdf_size, "data": data}, f)
+    blob = pickle.dumps({"pdf_name": enc_pdf.name, "pdf_size": pdf_size, "data": data})
+    cache_path.write_bytes(crypto.encrypt_bytes(blob, ctx.data_key))
     return data
 
 
@@ -228,7 +237,6 @@ def to_scheme_rows(
         amc = entries[0][0]
         folio_entries: list[FolioEntry] = []
 
-        # Per-folio first; aggregate after.
         for amc_x, folio_no, s in entries:
             val = s.get("valuation") or {}
             f_invested = float(val.get("cost") or 0)
@@ -250,7 +258,6 @@ def to_scheme_rows(
                 transactions=_normalize_transactions(s),
             ))
 
-        # Scheme totals from folio entries.
         invested = sum(f.invested for f in folio_entries)
         cas_value = sum(f.current_value for f in folio_entries)
         units = sum(f.units for f in folio_entries)
@@ -258,8 +265,6 @@ def to_scheme_rows(
         nav_date = max((f.nav_date for f in folio_entries), default=date.today())
         nav_source = "CAS"
 
-        # Override with latest AMFI NAV if available and newer. Apply to every folio
-        # so per-folio current_value/xirr stay consistent with the scheme total.
         amfi = nav_lookup.get(isin)
         if amfi and units > 0:
             amfi_nav, amfi_date = amfi
@@ -273,7 +278,6 @@ def to_scheme_rows(
                     f.current_value = round(f.units * amfi_nav, 2)
         current_value = sum(f.current_value for f in folio_entries)
 
-        # Per-folio XIRR (with terminal cashflow).
         for f in folio_entries:
             f_full = list(f.cashflows)
             if f.current_value > 0:
@@ -283,7 +287,6 @@ def to_scheme_rows(
             except Exception:
                 f.xirr = None
 
-        # Scheme-level XIRR.
         full_cashflows: list[tuple[date, float]] = []
         for f in folio_entries:
             full_cashflows.extend(f.cashflows)

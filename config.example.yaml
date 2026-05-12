@@ -1,16 +1,19 @@
-cams:
-  email: you@example.com         # email registered in your MF folios
-  pdf_password: ChooseAStrongOne  # this will encrypt the CAS PDF emailed to you
-  from_date: 2014-01-01           # YYYY-MM-DD; statement period start
-  to_date: today                  # YYYY-MM-DD or the literal "today"
-  dry_run: true                   # true = fill the form but DO NOT click Submit
+# Non-secret app config. Per-user credentials (Gmail App Password, CAS PDF
+# password, etc.) are NOT here — those live encrypted in data/app.db, which
+# is gitignored and never leaves your machine.
 
-gmail:
-  email: you@example.com                  # inbox to watch (usually same as cams.email)
-  app_password: "xxxx xxxx xxxx xxxx"     # myaccount.google.com/apppasswords
+# The single user who is allowed to invite others. After first launch this
+# email is the only one that can self-register as admin.
+admin_email: you@example.com
+
+cams:
   cams_sender: donotreply@camsonline.com
   cams_subject: "CAMS Mailback Request"
 
+gmail:
+  imap_host: imap.gmail.com
+  imap_port: 993
+
 playwright:
-  headless: false                 # set true once selectors are stable
-  slow_mo_ms: 250                 # 0 for normal speed; 250 helps see what's happening
+  headless: true                  # set false to watch the CAS form being filled
+  slow_mo_ms: 0

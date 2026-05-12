@@ -19,10 +19,7 @@ UNIT_REMOVING_TX = {"REDEMPTION", "SWITCH_OUT"}
 DEBT_REGIME_CUTOFF = date(2023, 4, 1)
 EQUITY_HOLDING_DAYS = 365   # >12 months
 DEBT_HOLDING_DAYS = 730     # >24 months
-EQUITY_STCG_RATE = 0.20
-EQUITY_LTCG_RATE = 0.125
 EQUITY_LTCG_EXEMPTION = 125_000   # per FY
-DEBT_OLD_LTCG_RATE = 0.125
 
 # Tax buckets each lot's gain falls into.
 EQ_STCG = "EQ_STCG"
@@ -51,17 +48,11 @@ class GainEntry:
 
 @dataclass
 class TaxResult:
-    available_units: float
-    redeemed_units: float
     sale_value: float
     cost_basis: float
     total_gain: float
     bucket_gain: dict[str, float] = field(default_factory=dict)
-    bucket_tax: dict[str, float] = field(default_factory=dict)
-    total_tax: float = 0.0
-    net_proceeds: float = 0.0
     breakdown: list[GainEntry] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
 
 
 def current_fy_window(today: date | None = None) -> tuple[date, date]:
@@ -166,9 +157,11 @@ def simulate_redemption(
     current_nav: float,
     is_equity: bool,
     today: date | None = None,
-    slab_rate: float = 0.30,
-    equity_exemption_remaining: float = EQUITY_LTCG_EXEMPTION,
 ) -> TaxResult:
+    """FIFO-consume up to ``redeem_units`` from ``open_lots`` at ``current_nav``,
+    classify each consumed slice into a tax bucket, return per-lot breakdown
+    + totals. UI handles tax-rate math separately — this function only sorts
+    the gains into LTCG/STCG buckets."""
     today = today or date.today()
     available = sum(l.units for l in open_lots)
     redeem_units = min(redeem_units, available)
@@ -181,13 +174,11 @@ def simulate_redemption(
         sell = min(lot.units, units_left)
         sale = sell * current_nav
         cost = sell * lot.nav
-        gain = sale - cost
-        days = (today - lot.date).days
-        bucket = _classify(lot.date, today, is_equity)
         breakdown.append(GainEntry(
             lot_date=lot.date,
-            units=sell, cost=cost, sale=sale, gain=gain,
-            days_held=days, bucket=bucket,
+            units=sell, cost=cost, sale=sale, gain=sale - cost,
+            days_held=(today - lot.date).days,
+            bucket=_classify(lot.date, today, is_equity),
         ))
         units_left -= sell
 
@@ -195,49 +186,12 @@ def simulate_redemption(
     for b in breakdown:
         bucket_gain[b.bucket] += b.gain
 
-    bucket_tax = {
-        EQ_STCG: max(0.0, bucket_gain[EQ_STCG]) * EQUITY_STCG_RATE,
-        EQ_LTCG: max(0.0, bucket_gain[EQ_LTCG] - equity_exemption_remaining) * EQUITY_LTCG_RATE,
-        DEBT_SLAB: max(0.0, bucket_gain[DEBT_SLAB]) * slab_rate,
-        DEBT_LTCG: max(0.0, bucket_gain[DEBT_LTCG]) * DEBT_OLD_LTCG_RATE,
-    }
-    total_tax = sum(bucket_tax.values())
     sale_value = sum(b.sale for b in breakdown)
     cost_basis = sum(b.cost for b in breakdown)
-    total_gain = sale_value - cost_basis
-
-    notes: list[str] = []
-    if is_equity and bucket_gain[EQ_LTCG] > 0 and equity_exemption_remaining > 0:
-        applied = min(bucket_gain[EQ_LTCG], equity_exemption_remaining)
-        notes.append(
-            f"Applied ₹{applied:,.0f} of equity LTCG exemption "
-            f"(remaining cap entered: ₹{equity_exemption_remaining:,.0f})."
-        )
-    if not is_equity and bucket_gain[DEBT_SLAB] > 0:
-        notes.append(
-            f"Debt / post-Apr-2023 lots taxed at slab rate ({slab_rate*100:.0f}%)."
-        )
-    if not is_equity and bucket_gain[DEBT_LTCG] > 0:
-        notes.append(
-            "Pre-Apr-2023 debt lots held >24 months get LTCG @ 12.5% (no indexation)."
-        )
-    if redeem_units < (available - 1e-3) and any(l.units > 0 for l in open_lots):
-        pass  # partial redemption is fine
-    notes.append(
-        "FIFO is aggregated across folios in this scheme — actual AMC tax may "
-        "differ slightly if you redeem from specific folios only."
-    )
-
     return TaxResult(
-        available_units=available,
-        redeemed_units=redeem_units,
         sale_value=sale_value,
         cost_basis=cost_basis,
-        total_gain=total_gain,
+        total_gain=sale_value - cost_basis,
         bucket_gain=bucket_gain,
-        bucket_tax=bucket_tax,
-        total_tax=total_tax,
-        net_proceeds=sale_value - total_tax,
         breakdown=breakdown,
-        notes=notes,
     )
