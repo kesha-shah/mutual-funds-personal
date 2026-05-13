@@ -174,7 +174,7 @@ def invite_post(
         return _render("invite.html", request,
                        invitee_email=invite["invitee_email"], token=token, error=str(e))
     response = _redirect("/setup")
-    _set_session_cookie(response, new_token)
+    sessions.attach(response, new_token)
     return response
 
 
