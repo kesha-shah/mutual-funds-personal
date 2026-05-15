@@ -280,6 +280,14 @@ def main() -> None:
         )
         st.stop()
 
+    # Streamlit's top-right hamburger exposes cache-clear / rerun / dev options
+    # that aren't meant for regular users. Show it to admins only.
+    if not session.is_admin:
+        st.markdown(
+            "<style>[data-testid='stToolbar']{display:none!important;}</style>",
+            unsafe_allow_html=True,
+        )
+
     consume_flash()
     _apply_sort_param()
     st.session_state["_selected_scheme_id"] = st.query_params.get("scheme") or None
