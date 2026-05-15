@@ -220,13 +220,34 @@ def submit_via_playwright(ctx: AccountContext, *, dry_run: bool = False, headles
     is_headless = pw_cfg.get("headless", True) if headless is None else headless
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        # Use the real installed Chrome (channel="chrome") rather than the
+        # bundled Chromium build, and strip the most obvious automation tells.
+        # reCAPTCHA on the CAMS form scores Playwright Chromium as a bot even
+        # in headed mode because `navigator.webdriver === true` and the
+        # `--enable-automation` flag are visible; the args + init script below
+        # patch those out so the captcha is more likely to mint a token silently.
+        # Falls back to bundled Chromium if Chrome isn't installed locally.
+        launch_args = dict(
             headless=is_headless,
             slow_mo=pw_cfg.get("slow_mo_ms", 0) if not is_headless else 0,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-default-browser-check",
+                "--no-first-run",
+            ],
         )
+        try:
+            browser = p.chromium.launch(channel="chrome", **launch_args)
+        except Exception:
+            browser = p.chromium.launch(**launch_args)
+
         context = browser.new_context(
             viewport={"width": 1440, "height": 900},
             locale="en-IN",
+        )
+        # Hide `navigator.webdriver` (reCAPTCHA's single most popular check).
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
         try:
