@@ -34,7 +34,7 @@ from ui.cas_workflow import render_cas_workflow  # noqa: E402
 from ui.donut import breakdown_data, render_donut  # noqa: E402
 from ui.format import TYPE_DISPLAY, fmt_inr, fmt_pct  # noqa: E402
 from ui.inflow_planner import render_inflow_planner  # noqa: E402
-from ui.query import clear_query_keep_account  # noqa: E402
+from ui.query import clear_query_keep_filters  # noqa: E402
 from ui.scheme_card import (  # noqa: E402
     CARD_CSS, SORT_DEFAULT_ASC, SORT_KEYS, render_scheme_card, render_sort_header,
 )
@@ -94,7 +94,7 @@ def _apply_sort_param() -> None:
         st.session_state["_sort_key"] = new_key
         st.session_state["_sort_asc"] = SORT_DEFAULT_ASC.get(new_key, False)
     scheme = qp.get("scheme")
-    clear_query_keep_account()
+    clear_query_keep_filters()
     if scheme:
         st.query_params["scheme"] = scheme
     st.rerun()
@@ -113,35 +113,70 @@ FILTER_LABELS = {
 }
 
 
+def _seed(key: str, value) -> None:
+    """Initialise a widget's session_state from the URL on a fresh page load
+    (cards/sort links are full reloads → empty session_state). Only seeds when
+    absent so in-session edits win; we don't pass ``default=`` to the widgets,
+    which keeps Streamlit from warning about default-vs-session-state conflicts."""
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _sync_filter_params(
+    view_choice: str, type_filter: str, selected_amcs: list[str],
+    plan_choice: str, sub_choice: str,
+) -> None:
+    """Write the active selections into the query string so they survive the
+    full-page reload that scheme-detail navigation triggers. Defaults are
+    removed rather than written, keeping the URL clean."""
+    def put(key: str, value, *, is_default: bool) -> None:
+        if is_default:
+            if key in st.query_params:
+                del st.query_params[key]
+        else:
+            st.query_params[key] = value
+
+    put("view", "total", is_default=view_choice != "Total funds")
+    put("class", type_filter, is_default=type_filter == "ALL")
+    put("amc", selected_amcs, is_default=not selected_amcs)
+    put("plan", plan_choice, is_default=plan_choice == "All")
+    put("sub", sub_choice, is_default=sub_choice == "All")
+
+
 def _render_filters(rows: list[SchemeRow]) -> tuple[list[SchemeRow], list[SchemeRow], str]:
     """Returns (type_filtered_full, visible_after_all_filters, type_filter_key).
-    type_filtered_full is what the donut chart uses; visible is the schemes list."""
+    type_filtered_full is what the donut chart uses; visible is the schemes list.
+    Filter state is mirrored to the URL (see _sync_filter_params) so it persists
+    across the full reload that opening a scheme card causes."""
+    _seed("view_mode_seg",
+          "Total funds" if st.query_params.get("view") == "total" else "Active funds")
     view_choice = st.segmented_control(
         "View",
         options=["Active funds", "Total funds"],
-        default="Active funds",
         key="view_mode_seg",
         help="Active = currently held only. Total = includes fully-redeemed funds and their lifetime XIRR.",
     ) or "Active funds"
     show_redeemed = view_choice == "Total funds"
 
     label_to_key = {v: k for k, v in FILTER_LABELS.items()}
+    _seed("type_filter_seg", FILTER_LABELS.get(st.query_params.get("class") or "ALL", "All"))
     chosen_label = st.segmented_control(
         "Asset class",
         options=list(FILTER_LABELS.values()),
-        default="All",
         key="type_filter_seg",
     ) or "All"
     type_filter = label_to_key[chosen_label]
 
     type_filtered = filter_rows(rows, type_filter)
 
-    # AMC multi-select. Empty selection = include all.
+    # AMC multi-select. Empty selection = include all. Keyed per type_filter so
+    # switching asset class starts fresh; seeded from the URL's repeated amc=.
     all_amcs = sorted({r.amc for r in type_filtered if r.amc})
+    _seed(f"amc_filter_{type_filter}",
+          [a for a in st.query_params.get_all("amc") if a in all_amcs])
     selected_amcs = st.multiselect(
         "AMC",
         options=all_amcs,
-        default=[],
         placeholder="All AMCs",
         key=f"amc_filter_{type_filter}",
         help="Filter by Asset Management Company. Leave empty to include all.",
@@ -149,10 +184,12 @@ def _render_filters(rows: list[SchemeRow]) -> tuple[list[SchemeRow], list[Scheme
     if selected_amcs:
         type_filtered = [r for r in type_filtered if r.amc in selected_amcs]
 
+    plan_options = ["All", "Direct", "Regular"]
+    qp_plan = st.query_params.get("plan")
+    _seed(f"plan_filter_{type_filter}", qp_plan if qp_plan in plan_options else "All")
     plan_choice = st.segmented_control(
         "Plan",
-        options=["All", "Direct", "Regular"],
-        default="All",
+        options=plan_options,
         key=f"plan_filter_{type_filter}",
     ) or "All"
     if plan_choice != "All":
@@ -168,7 +205,8 @@ def _render_filters(rows: list[SchemeRow]) -> tuple[list[SchemeRow], list[Scheme
         sub_options = ["All"] + available_subs
         sub_key = f"sub_seg_{type_filter}"
         if st.session_state.get(sub_key) not in sub_options:
-            st.session_state[sub_key] = "All"
+            qp_sub = st.query_params.get("sub")
+            st.session_state[sub_key] = qp_sub if qp_sub in sub_options else "All"
         sub_choice = st.segmented_control(
             f"{FILTER_LABELS[type_filter]} sub-category",
             options=sub_options,
@@ -184,6 +222,8 @@ def _render_filters(rows: list[SchemeRow]) -> tuple[list[SchemeRow], list[Scheme
 
     sub_filtered = [r for r in type_filtered if matches_sub(r)]
     visible = sub_filtered if show_redeemed else [r for r in sub_filtered if r.current_value > 0]
+
+    _sync_filter_params(view_choice, type_filter, selected_amcs, plan_choice, sub_choice)
     return type_filtered, visible, type_filter
 
 
@@ -359,10 +399,10 @@ def main() -> None:
     if selected_id:
         selected_row = next((r for r in rows if (r.isin or r.scheme) == selected_id), None)
         if selected_row is None:
-            clear_query_keep_account()
+            clear_query_keep_filters()
         else:
             if st.button("← Back to portfolio", key="back_to_list"):
-                clear_query_keep_account()
+                clear_query_keep_filters()
                 st.rerun()
             render_scheme_detail(selected_row, rows)
             return

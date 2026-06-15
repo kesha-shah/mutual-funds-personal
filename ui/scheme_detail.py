@@ -15,7 +15,7 @@ from analytics.tax import (
     simulate_redemption,
 )
 from ui.format import color_signed, fmt_inr, fmt_pct
-from ui.query import clear_query_keep_account
+from ui.query import clear_query_keep_filters
 
 
 def fy_realized_equity_ltcg(all_rows: list[SchemeRow]) -> tuple[float, date, date]:
@@ -213,7 +213,7 @@ def render_scheme_detail(r: SchemeRow, all_rows: list[SchemeRow]) -> None:
         st.caption(f"{r.amc} · {r.sub_type} · ISIN {r.isin or '—'}")
     with header_cols[1]:
         if st.button("Close", use_container_width=True, key=f"close_detail_{r.isin or r.scheme}"):
-            clear_query_keep_account()
+            clear_query_keep_filters()
             st.rerun()
 
     cols = st.columns(4)
