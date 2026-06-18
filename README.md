@@ -61,6 +61,17 @@ To invite a second user (e.g. spouse), open **⚙️ Settings → 👥 Invite a 
 
 > You never visit `:8501` directly. The dashboard reads its session from a signed header the gateway injects on every proxied request; direct access shows an error. Streamlit's port / XSRF / CORS settings are baked into `.streamlit/config.toml` so the command stays simple.
 
+### Run with Docker
+
+Instead of the venv + two-terminal setup above, you can run everything in one container — it bundles Python + Chromium, so no separate `pip install` / `playwright install` step:
+
+```bash
+cp config.example.yaml config.yaml   # set admin_email
+docker compose up --build
+```
+
+Open **http://localhost:8000**. The entrypoint launches both the Streamlit backend and the auth gateway behind an Xvfb virtual display, so the headful CAMS scrape still clears reCAPTCHA. `data/` and `config.yaml` are mounted from the host and survive rebuilds; debug captures go to a named volume to keep the repo clean.
+
 ### Seeding a local demo account
 
 If you're publicly hosting your instance and want a "kick the tyres" account visitors can use without seeing real data, run:

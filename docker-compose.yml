@@ -1,0 +1,20 @@
+services:
+  app:
+    build: .
+    image: mutual-funds-personal
+    ports:
+      # Only the auth gateway is published. Visit http://localhost:8000
+      - "8000:8000"
+    volumes:
+      # Persist everything: encrypted PDFs, parsed cache, SQLite store, server
+      # secret. This is the one directory that must survive container rebuilds.
+      - ./data:/app/data
+      # Your non-secret config. Edit it on the host; admin_email must be set.
+      # Read-only so the container can't rewrite it.
+      - ./config.yaml:/app/config.yaml:ro
+      # Playwright debug screenshots/HTML — named volume keeps them out of the repo.
+      - debug:/app/debug
+    restart: unless-stopped
+
+volumes:
+  debug:

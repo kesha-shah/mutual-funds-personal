@@ -1,0 +1,17 @@
+# Keep the build context small and the image free of host-only / secret state.
+.venv/
+__pycache__/
+*.pyc
+*.pkl
+.git/
+.claude/
+.DS_Store
+
+# Runtime data and secrets — mounted as volumes, never baked into the image.
+data/
+debug/
+config.yaml
+.env
+*.db
+*.sqlite
+*.pdf
