@@ -66,6 +66,42 @@ def dismiss_disclaimer(page: Page) -> None:
     page.wait_for_timeout(500)
 
 
+def dismiss_promo(page: Page) -> None:
+    """CAMS *sometimes* shows a promotional mat-dialog after the Disclaimer
+    (e.g. "AlphaGrep Mutual Fund is now live!") that overlays the form. Close it
+    if present. This is entirely best-effort: if no popup appears (CAMS drops it,
+    or it doesn't show on a given visit) we return quickly, and the rest of the
+    flow proceeds unchanged. Never raises."""
+    dialog = page.locator("mat-dialog-container")
+    try:
+        dialog.first.wait_for(state="visible", timeout=4000)
+    except PWTimeout:
+        return  # no popup this visit -> nothing to do
+    print("-> promo popup detected; closing")
+    for sel in (
+        "mat-dialog-container mat-icon.close-popup",
+        "mat-dialog-container .closeicon",
+        "mat-dialog-container [aria-label='Close']",
+        "mat-dialog-container button.mat-dialog-close",
+    ):
+        try:
+            page.locator(sel).first.click(timeout=1500)
+            break
+        except Exception:
+            continue
+    # If a close control wasn't found/worked, Escape dismisses a mat-dialog too.
+    try:
+        if dialog.first.is_visible():
+            page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        dialog.first.wait_for(state="hidden", timeout=4000)
+    except PWTimeout:
+        print("   warning: promo popup may still be open; continuing anyway")
+    page.wait_for_timeout(300)
+
+
 def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> None:
     email = ctx.email
     pdf_password = ctx.pdf_password
@@ -77,6 +113,7 @@ def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> Non
     dump_debug(page, "01_loaded")
 
     dismiss_disclaimer(page)
+    dismiss_promo(page)
     dump_debug(page, "02_after_cookie")
 
     for sel in ["button[aria-label='Close']", ".close-chat", "#chat-close"]:
@@ -93,20 +130,56 @@ def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> Non
         except PWTimeout:
             pass
 
-    def click_radio(value: str, description: str) -> None:
-        print(f"-> selecting {description} (value={value})")
-        page.locator(f'mat-radio-button:has(input[value="{value}"])').click(force=True)
+    def click_radio(
+        value: str,
+        description: str,
+        label: str | None = None,
+        prefer_label: bool = False,
+    ) -> None:
+        """Select a mat-radio-button. Matches by input value="..." by default;
+        set prefer_label=True to match the visible label text first (use this
+        where CAMS reuses/swaps the value= codes, e.g. the folio-listing group
+        where "N"/"Y" have flipped meanings between form revisions)."""
+        print(f"-> selecting {description}")
+        by_label = (
+            page.locator("mat-radio-button", has_text=label).first if label else None
+        )
+        by_value = page.locator(f'mat-radio-button:has(input[value="{value}"])')
+        primary, secondary = (
+            (by_label, by_value) if prefer_label and by_label else (by_value, by_label)
+        )
+        try:
+            primary.wait_for(state="attached", timeout=15_000)
+            primary.click(force=True)
+            return
+        except PWTimeout:
+            pass
+        # primary selector failed (CAMS may have renamed/swapped it); capture the
+        # live DOM and fall back to the other matching strategy.
+        dump_debug(page, f"radio_fail_{value}")
+        if secondary is not None:
+            print(f"   primary match failed; falling back for {description!r}")
+            secondary.wait_for(state="attached", timeout=15_000)
+            secondary.click(force=True)
+            return
+        raise PWTimeout(
+            f"radio value={value!r} ({description}) not found; see debug/radio_fail_{value}.html"
+        )
 
-    click_radio("detailed", "Detailed statement type")
+    click_radio("detailed", "Detailed statement type", label="Detailed")
     page.wait_for_timeout(800)
+    dump_debug(page, "after_detailed")
 
+    # Selecting "detailed" reveals the Period radios (formcontrolname
+    # "request_flag": CF/PF/SP, defaulting to CF) plus From/To date inputs.
+    # Choose SP (Specific Period) so we can set an explicit date range.
     click_radio("SP", "Specific Period")
     page.wait_for_timeout(800)
     dump_debug(page, "after_sp")
 
-    def fill_date(input_id: str, value: str, description: str) -> None:
+    def fill_date(control: str, value: str, description: str) -> None:
         print(f"-> filling {description}: {value}")
-        page.locator(f"input#{input_id}").evaluate(
+        page.locator(f'input[formcontrolname="{control}"]').evaluate(
             """(el, val) => {
                 el.removeAttribute('readonly');
                 el.removeAttribute('disabled');
@@ -118,10 +191,18 @@ def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> Non
             value,
         )
 
-    fill_date("fromDate_new", _form_date(from_date), "From date")
-    fill_date("to-date-input", _form_date(to_date), "To date")
+    fill_date("from_date", _form_date(from_date), "From date")
+    fill_date("to_date", _form_date(to_date), "To date")
 
-    click_radio("N", "Without zero balance folios")
+    # CAMS has swapped the folio-listing value codes between revisions
+    # (value="N" once meant "Without", now means "With"), so match the stable
+    # visible label rather than the volatile code.
+    click_radio(
+        "Y",
+        "Without zero balance folios",
+        label="Without zero balance folios",
+        prefer_label=True,
+    )
 
     print(f"-> filling email: {email}")
     page.locator('input[formcontrolname="email_id"]').fill(email)
