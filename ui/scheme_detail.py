@@ -12,7 +12,7 @@ from analytics.portfolio import SchemeRow
 from analytics.tax import (
     DEBT_LTCG, DEBT_SLAB, EQ_LTCG, EQ_STCG, EQUITY_LTCG_EXEMPTION,
     build_open_lots, current_fy_window, realized_ltcg_in_window,
-    simulate_redemption,
+    redemption_amount_for_target_ltcg, simulate_redemption,
 )
 from ui.format import color_signed, fmt_inr, fmt_pct
 from ui.query import clear_query_keep_filters
@@ -61,20 +61,59 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
     )
     is_equity = treat_choice == "Equity"
 
+    # Compute the FY equity-LTCG exemption status ONCE (it scans every scheme
+    # and folio) and reuse it for both the smart default and the metric row.
+    realized = 0.0
+    ltcg_room = 0.0
+    harvest_amount = 0.0
+    if is_equity:
+        realized, _, _ = fy_realized_equity_ltcg(all_rows)
+        ltcg_room = max(0.0, EQUITY_LTCG_EXEMPTION - realized)
+        if ltcg_room > 0:
+            harvest_amount = redemption_amount_for_target_ltcg(
+                open_lots, r.nav, ltcg_room, is_equity=True
+            )
+    default_amount = (
+        min(harvest_amount, available_value)
+        if harvest_amount > 0
+        else float(available_value)
+    )
+
+    # Pre-fill the widget with the smart default only the first time it
+    # renders; afterwards the user's own edits win (widget state persists).
+    amount_key = f"redeem_amt_{r.isin or r.scheme}"
+    if amount_key not in st.session_state:
+        st.session_state[amount_key] = default_amount
+
     cols = st.columns([2, 1])
     with cols[0]:
         amount = st.number_input(
             "Amount to redeem (₹)",
             min_value=0.0,
             max_value=float(available_value),
-            value=float(available_value),
             step=10000.0,
             format="%.0f",
-            key=f"redeem_amt_{r.isin or r.scheme}",
+            key=amount_key,
             help=f"Max: {fmt_inr(available_value)} ({available_units:,.4f} units @ ₹{r.nav:,.4f})",
         )
     with cols[1]:
         st.metric("Available", fmt_inr(available_value))
+
+    # One-line note about why the box is pre-filled the way it is.
+    if is_equity and ltcg_room > 0:
+        if harvest_amount > 0:
+            full_holding_ltcg = simulate_redemption(
+                open_lots, available_units, r.nav, is_equity=True
+            ).bucket_gain.get(EQ_LTCG, 0.0)
+            if full_holding_ltcg <= ltcg_room:
+                st.caption(
+                    f"💡 Pre-filled with your entire holding — redeeming it all yields "
+                    f"only {fmt_inr(full_holding_ltcg)} LTCG, within your {fmt_inr(ltcg_room)} room."
+                )
+            else:
+                st.caption(f"💡 Pre-filled to use up your remaining {fmt_inr(ltcg_room)} tax-free room.")
+        else:
+            st.caption("💡 No long-term lots yet — nothing to harvest tax-free right now.")
 
     res = simulate_redemption(
         open_lots,
@@ -87,36 +126,51 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
     stcg_total = res.bucket_gain.get(EQ_STCG, 0.0) + res.bucket_gain.get(DEBT_SLAB, 0.0)
     threshold_label = "12 months" if is_equity else "24 months"
 
-    st.markdown(
-        f"""
-- Sale value &nbsp; **{fmt_inr(res.sale_value)}**
-- Amount invested (FIFO) &nbsp; **{fmt_inr(res.cost_basis)}**
+    # --- Headline answer: the 3-4 numbers the user actually cares about. ---
+    if is_equity:
+        ltcg_after = realized + max(0.0, ltcg_total)
+        excess = max(0.0, ltcg_after - EQUITY_LTCG_EXEMPTION)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("You redeem", fmt_inr(res.sale_value))
+        m2.metric("LTCG (this redemption)", fmt_inr(ltcg_total))
+        m3.metric("STCG (taxable)", fmt_inr(stcg_total))
+        m4.metric(
+            "Tax-Free LTCG Available",
+            fmt_inr(ltcg_room),
+            help="Equity-LTCG room still available tax-free this FY "
+                 f"(₹{EQUITY_LTCG_EXEMPTION:,} cap minus {fmt_inr(realized)} already realized).",
+        )
+
+        if excess > 0:
+            st.warning(
+                f"⚠️ LTCG of {fmt_inr(ltcg_total)} exceeds your tax-free room by "
+                f"{fmt_inr(excess)} — that excess is taxable."
+            )
+        elif ltcg_total > 0:
+            st.success(
+                f"✅ Entire {fmt_inr(ltcg_total)} LTCG fits within your tax-free room."
+            )
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("You redeem", fmt_inr(res.sale_value))
+        m2.metric("LTCG", fmt_inr(ltcg_total))
+        m3.metric("STCG / slab", fmt_inr(stcg_total))
+
+    # --- The rest is detail; tuck it away. ---
+    with st.expander("How is this calculated?", expanded=False):
+        st.markdown(
+            f"""
+- Amount invested (FIFO cost) &nbsp; **{fmt_inr(res.cost_basis)}**
 - Total gain &nbsp; **{fmt_inr(res.total_gain)}**
     - LTCG (held >{threshold_label}) &nbsp; **{fmt_inr(ltcg_total)}**
     - STCG (held ≤{threshold_label}) &nbsp; **{fmt_inr(stcg_total)}**
 """
-    )
-
-    # FY exemption tracker (only meaningful for equity LTCG).
-    if is_equity:
-        realized, fy_start, fy_end = fy_realized_equity_ltcg(all_rows)
-        ltcg_after = realized + max(0.0, ltcg_total)
-        remaining_now = max(0.0, EQUITY_LTCG_EXEMPTION - realized)
-        remaining_after = max(0.0, EQUITY_LTCG_EXEMPTION - ltcg_after)
-        excess = max(0.0, ltcg_after - EQUITY_LTCG_EXEMPTION)
-
-        st.markdown(
-            f"""
-**Equity LTCG exemption — FY {fy_start.strftime('%b %Y')} → {fy_end.strftime('%d %b %Y')}** &nbsp;(₹{EQUITY_LTCG_EXEMPTION:,}/yr cap)
-- Already realized this FY (across all your equity funds) &nbsp; **{fmt_inr(realized)}**
-- LTCG room remaining today &nbsp; **{fmt_inr(remaining_now)}**
-- If you proceed with this redemption &nbsp; **{fmt_inr(remaining_after)}** room left
-"""
         )
-        if excess > 0:
+        if is_equity:
             st.caption(
-                f"⚠️ This redemption would push you ₹{excess:,.0f} over the "
-                f"₹{EQUITY_LTCG_EXEMPTION:,} exemption — that excess is taxable LTCG."
+                f"Equity LTCG exemption ₹{EQUITY_LTCG_EXEMPTION:,}/FY · "
+                f"already used {fmt_inr(realized)} across all your equity funds this FY."
             )
 
     with st.expander(f"📋 Lot-by-lot breakdown ({len(res.breakdown)} lots)", expanded=False):

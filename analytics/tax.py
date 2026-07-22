@@ -195,3 +195,44 @@ def simulate_redemption(
         bucket_gain=bucket_gain,
         breakdown=breakdown,
     )
+
+
+def redemption_amount_for_target_ltcg(
+    open_lots: list[Lot],
+    current_nav: float,
+    target_ltcg: float,
+    is_equity: bool,
+    today: date | None = None,
+) -> float:
+    """Smallest FIFO redemption whose *long-term* gain equals ``target_ltcg``.
+
+    Binary-searches on top of :func:`simulate_redemption` so the result is
+    always consistent with the lot-by-lot breakdown the UI displays — FIFO
+    forces us through every older lot (including any STCG/loss lots that
+    precede the LT ones), which a naive per-lot solver would get wrong.
+
+    Returns the redemption *sale value* (₹). 0.0 when the target is already
+    met or no redemption can produce any LTCG (e.g. no long-term lots yet).
+    """
+    if target_ltcg <= 0 or current_nav <= 0:
+        return 0.0
+    total_units = sum(l.units for l in open_lots)
+    if total_units <= 0:
+        return 0.0
+
+    def _ltcg_at(units: float) -> float:
+        res = simulate_redemption(open_lots, units, current_nav, is_equity, today)
+        return res.bucket_gain.get(EQ_LTCG, 0.0) + res.bucket_gain.get(DEBT_LTCG, 0.0)
+
+    # Even redeeming everything can't reach the target → harvest all of it.
+    if _ltcg_at(total_units) <= 0:
+        return 0.0
+
+    lo, hi = 0.0, total_units
+    for _ in range(50):  # ~1e-15 unit precision — more than enough for ₹
+        mid = (lo + hi) / 2
+        if _ltcg_at(mid) >= target_ltcg:
+            hi = mid
+        else:
+            lo = mid
+    return hi * current_nav
