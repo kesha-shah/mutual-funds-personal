@@ -198,9 +198,9 @@ def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> Non
     # (value="N" once meant "Without", now means "With"), so match the stable
     # visible label rather than the volatile code.
     click_radio(
-        "Y",
-        "Without zero balance folios",
-        label="Without zero balance folios",
+        "N",
+        "With zero balance folios",
+        label="With zero balance folios",
         prefer_label=True,
     )
 
