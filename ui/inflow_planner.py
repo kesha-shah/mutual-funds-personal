@@ -2,7 +2,7 @@
 putting in (daily / weekly / monthly), and see the combined monthly inflow
 grouped by category as a donut.
 
-Entries are saved per account in ``state.json`` (keyed by slug) so they're
+Entries are saved per account in ``planner.json`` (keyed by slug) so they're
 still there next time you log in — edit freely, every change is persisted.
 The demo account is read-only, so there the planner stays session-only."""
 from __future__ import annotations
@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from analytics.portfolio import SchemeRow
-from analytics.state import load_state, update_state
+from analytics.state import load_planner, save_planner
 from ui.donut import render_donut
 from ui.format import fmt_inr
 
@@ -23,7 +23,11 @@ FREQ_OPTS = list(FREQ_MULT)
 # the target fund, but only SIP is new capital leaving your bank account.
 KIND_OPTS = ["SIP", "STP"]
 
-_STATE_KEY = "inflow_planner"
+# Where the instalment is registered. Presets cover the common platforms; the
+# sentinel below opens a free-text box so you can name anything else, and once
+# typed that value is remembered as a preset for later rows/sessions.
+SOURCE_PRESETS = ["MFCentral", "Direct", "Kuvera"]
+SOURCE_OTHER = "Other…"
 
 
 def _k(name: str, slug: str) -> str:
@@ -44,11 +48,12 @@ def _fund_id(r: SchemeRow) -> str:
 
 
 def _load_saved(slug: str) -> dict:
-    """{fund_id: {"amount": float, "freq": str, "kind": str}} from disk,
-    defensively typed. Entries written before the SIP/STP split have no
-    ``kind`` (and a short-lived build wrote it as ``type``) — both read back
-    as SIP rather than being dropped."""
-    raw = load_state(slug).get(_STATE_KEY, {})
+    """{fund_id: {"amount": float, "freq": str, "kind": str, "source": str,
+    "comment": str}} from disk, defensively typed. Entries written before the
+    SIP/STP split have no ``kind`` (and a short-lived build wrote it as
+    ``type``) — both read back as SIP rather than being dropped. Older entries
+    also predate source/comment, which default to empty."""
+    raw = load_planner(slug)
     out: dict[str, dict] = {}
     if isinstance(raw, dict):
         for fid, v in raw.items():
@@ -59,8 +64,40 @@ def _load_saved(slug: str) -> dict:
                     "amount": float(v.get("amount") or 0.0),
                     "freq": freq if freq in FREQ_MULT else "Monthly",
                     "kind": kind if kind in KIND_OPTS else "SIP",
+                    # Free text, so anything goes — just normalise the type and
+                    # never let the sentinel itself become a stored value.
+                    "source": ("" if str(v.get("source") or "").strip() == SOURCE_OTHER
+                               else str(v.get("source") or "").strip()),
+                    "comment": str(v.get("comment") or "").strip(),
                 }
     return out
+
+
+def _source_options(saved: dict, slug: str) -> list[str]:
+    """Presets + every custom source already saved on disk, ``SOURCE_OTHER``
+    last — computed once per session and then frozen.
+
+    Frozen is the whole point. Streamlit keeps a selectbox's state as an *index
+    into ``options``*, so handing it a different list on a later rerun throws
+    every source selection on the page away. Folding a just-typed custom source
+    into the options is therefore exactly the wrong move: it wipes the other
+    rows, then the text box vanishes with them and the list shrinks back, which
+    wipes them again. A custom source instead lives in its own text box for the
+    rest of the session and joins this list on the next login, once it has been
+    persisted."""
+    cached = st.session_state.get(_k("src_opts", slug))
+    if cached:
+        return cached
+    extras: list[str] = []
+    seen = {s.casefold() for s in SOURCE_PRESETS}
+    for v in saved.values():
+        text = str(v.get("source") or "").strip()
+        if text and text != SOURCE_OTHER and text.casefold() not in seen:
+            seen.add(text.casefold())
+            extras.append(text)
+    opts = SOURCE_PRESETS + sorted(extras, key=str.lower) + [SOURCE_OTHER]
+    st.session_state[_k("src_opts", slug)] = opts
+    return opts
 
 
 def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> None:
@@ -69,7 +106,8 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
         "Pick funds you hold, enter how much you invest and how often — daily, "
         "weekly or monthly — and see the combined **monthly** inflow grouped by "
         "category. Daily is converted at 22 business days/month, weekly at "
-        "≈4.33 weeks/month. "
+        "≈4.33 weeks/month. Tag each entry with where it's registered and a "
+        "free-text note if you like. "
         + ("Changes are not saved on the demo account."
            if is_demo else "Your entries are saved and reload next time you log in.")
     )
@@ -94,6 +132,12 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
         st.session_state.setdefault(_k(f"amt_{fid}", slug), v["amount"])
         st.session_state.setdefault(_k(f"freq_{fid}", slug), v["freq"])
         st.session_state.setdefault(_k(f"kind_{fid}", slug), v["kind"])
+        st.session_state.setdefault(_k(f"cmt_{fid}", slug), v["comment"])
+        # A saved custom source is seeded straight into the selectbox (it is an
+        # option by then, see _source_options), so the "Other…" text box only
+        # ever holds what you type in this session.
+        if v["source"]:
+            st.session_state.setdefault(_k(f"src_{fid}", slug), v["source"])
 
     selected = st.multiselect(
         "Funds",
@@ -116,13 +160,18 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
         return
     st.session_state[_k("touched", slug)] = True
 
-    # Per-fund entry rows: name | amount | frequency | kind | monthly equivalent.
-    hdr = st.columns([4, 2, 2, 1.5, 2])
+    # Per-fund entry rows:
+    # name | amount | frequency | kind | source | comment | monthly equivalent.
+    src_opts = _source_options(saved, slug)
+    widths = [3.4, 1.7, 1.7, 1.3, 2.1, 2.6, 1.7]
+    hdr = st.columns(widths)
     hdr[0].markdown("**Fund**")
     hdr[1].markdown("**Amount (₹)**")
     hdr[2].markdown("**Frequency**")
     hdr[3].markdown("**Kind**")
-    hdr[4].markdown("**Monthly ≈**")
+    hdr[4].markdown("**Source**")
+    hdr[5].markdown("**Comment**")
+    hdr[6].markdown("**Monthly ≈**")
 
     plan: list[dict] = []
     to_save: dict[str, dict] = {}
@@ -131,7 +180,8 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
         st.session_state.setdefault(_k(f"amt_{fid}", slug), 0.0)
         st.session_state.setdefault(_k(f"freq_{fid}", slug), "Monthly")
         st.session_state.setdefault(_k(f"kind_{fid}", slug), "SIP")
-        c = st.columns([4, 2, 2, 1.5, 2])
+        st.session_state.setdefault(_k(f"cmt_{fid}", slug), "")
+        c = st.columns(widths)
         c[0].markdown(f"{r.scheme}  \n_{r.sub_type}_")
         amount = c[1].number_input(
             "Amount", min_value=0.0, step=500.0,
@@ -145,12 +195,33 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
             "Kind", KIND_OPTS, key=_k(f"kind_{fid}", slug),
             label_visibility="collapsed",
         )
+        picked = c[4].selectbox(
+            "Source", src_opts, index=None, placeholder="Source…",
+            key=_k(f"src_{fid}", slug), label_visibility="collapsed",
+            help="Where the instalment is registered. Pick “Other…” to type "
+                 "your own — it then shows up in this list everywhere.",
+        )
+        if picked == SOURCE_OTHER:
+            source = c[4].text_input(
+                "Custom source", key=_k(f"srctxt_{fid}", slug),
+                placeholder="e.g. Groww", label_visibility="collapsed",
+            ).strip()
+        else:
+            source = (picked or "").strip()
+        comment = c[5].text_input(
+            "Comment", key=_k(f"cmt_{fid}", slug), placeholder="optional note",
+            label_visibility="collapsed",
+            help="Anything you want to remember — “temporary”, “step-up in "
+                 "April”, which bank account it debits…",
+        ).strip()
         monthly = amount * FREQ_MULT[freq]
-        c[4].markdown(fmt_inr(monthly) if monthly else "—")
-        to_save[fid] = {"amount": amount, "freq": freq, "kind": kind}
+        c[6].markdown(fmt_inr(monthly) if monthly else "—")
+        to_save[fid] = {"amount": amount, "freq": freq, "kind": kind,
+                        "source": source, "comment": comment}
         if monthly > 0:
-            plan.append({"Category": r.sub_type, "Fund": r.scheme,
-                         "Kind": kind, "Monthly": monthly})
+            plan.append({"Category": r.sub_type, "Fund": r.scheme, "Kind": kind,
+                         "Source": source or "—", "Comment": comment,
+                         "Monthly": monthly})
 
     _persist(slug, is_demo, to_save, set(by_id))
 
@@ -158,7 +229,10 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
         st.info("Enter an amount for at least one fund to see the chart.")
         return
 
-    fund_df = pd.DataFrame(plan, columns=["Category", "Fund", "Kind", "Monthly"])
+    fund_df = pd.DataFrame(
+        plan,
+        columns=["Category", "Fund", "Kind", "Source", "Comment", "Monthly"],
+    )
     total = fund_df["Monthly"].sum()
     # Split the headline figure: SIP is new money leaving your bank each month,
     # STP is capital already invested being shifted, so only the SIP number is
@@ -209,6 +283,25 @@ def render_inflow_planner(rows: list[SchemeRow], slug: str, is_demo: bool) -> No
         use_container_width=True, hide_index=True,
     )
 
+    st.subheader("Planned inflow by source")
+    src_table = (
+        fund_df.groupby("Source", as_index=False)["Monthly"].sum()
+        .sort_values("Monthly", ascending=False)
+    )
+    src_table["Share"] = (src_table["Monthly"] / total * 100).round(2).astype(str) + "%"
+    st.dataframe(
+        src_table.style.format({"Monthly": fmt_inr}),
+        use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("Every planned instalment"):
+        st.dataframe(
+            fund_df[["Fund", "Category", "Kind", "Source", "Comment", "Monthly"]]
+            .sort_values("Monthly", ascending=False)
+            .style.format({"Monthly": fmt_inr}),
+            use_container_width=True, hide_index=True,
+        )
+
 
 def _persist(slug: str, is_demo: bool, plan: dict, known_ids: set[str]) -> None:
     """Merge ``plan`` into the saved plan and write it out, but only when
@@ -223,10 +316,8 @@ def _persist(slug: str, is_demo: bool, plan: dict, known_ids: set[str]) -> None:
     removed."""
     if is_demo:
         return
-    current = load_state(slug).get(_STATE_KEY, {})
-    if not isinstance(current, dict):
-        current = {}
+    current = load_planner(slug)
     merged = {fid: v for fid, v in current.items() if fid not in known_ids}
     merged.update(plan)
     if current != merged:
-        update_state(slug, **{_STATE_KEY: merged})
+        save_planner(slug, merged)
