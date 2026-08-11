@@ -14,6 +14,7 @@ from typing import Callable
 
 import streamlit as st
 
+from analytics import auth, crypto
 from analytics.accounts import AccountContext
 from analytics.demo import is_demo_slug
 from analytics.state import load_state, update_state
@@ -196,11 +197,127 @@ def _demo_process_inbox_button(slug: str, reset_caches: Callable[[], None]) -> N
     st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# Manual CAS upload — bypass the CAMS-form + Gmail round trip entirely.
+# The user attaches a CAS PDF they already have (e.g. downloaded from the
+# CAMS/KFintech portal or forwarded from another mailbox) and types the PDF
+# password. We stash the password as the account's stored cred, write the
+# PDF encrypted-at-rest exactly like the IMAP path, then re-parse.
+# ---------------------------------------------------------------------------
+
+def _pdf_password_ok(pdf_bytes: bytes, password: str) -> bool:
+    """True when ``password`` unlocks the (possibly unencrypted) CAS PDF.
+
+    Uses ``pdfminer.six`` — the same engine casparser parses with — so the
+    unlock check matches what the real parser will do, instead of waiting
+    ~90s for casparser to blow up on a wrong password.
+    """
+    import io
+
+    from pdfminer.pdfdocument import (
+        PDFDocument,
+        PDFEncryptionError,
+        PDFPasswordIncorrect,
+    )
+    from pdfminer.pdfparser import PDFParser
+
+    try:
+        parser = PDFParser(io.BytesIO(pdf_bytes))
+        PDFDocument(parser, password=password)
+    except (PDFPasswordIncorrect, PDFEncryptionError):
+        return False
+    except Exception:
+        return False
+    return True
+
+
+def _save_uploaded_cas(ctx: AccountContext, slug: str, filename: str, pdf_bytes: bytes) -> Path:
+    """Write the uploaded PDF to ``cas/`` encrypted-at-rest (same as IMAP).
+
+    A manual upload means the previous CAMS request chain is moot — clear the
+    baseline UID so a later "Process inbox" doesn't skip a genuinely newer
+    email, and drop the parse cache so the new PDF is parsed fresh.
+    """
+    from ingest.gmail_fetch import _safe_filename
+
+    out_name = f"manual_{int(time.time())}_{_safe_filename(filename)}.enc"
+    out_path = ctx.cas_dir / out_name
+    out_path.write_bytes(crypto.encrypt_bytes(pdf_bytes, ctx.data_key))
+
+    update_state(
+        slug,
+        last_fetched_pdf=str(out_path),
+        last_fetched_at=datetime.now().isoformat(),
+        request_baseline_uid=None,
+    )
+    return out_path
+
+
+def _render_upload_expander(
+    ctx: AccountContext,
+    slug: str,
+    session: "auth.Session | None",
+    reset_caches: Callable[[], None],
+    *,
+    disabled: bool = False,
+) -> None:
+    with st.expander("📤 Upload CAS manually"):
+        st.caption(
+            "Already have the CAS PDF? Attach it and enter its password — "
+            "no CAMS request or email needed."
+            + ("  \n_Demo — disabled, no real upload._" if disabled else "")
+        )
+        with st.form(f"upload_cas_form_{slug}", clear_on_submit=True):
+            uploaded = st.file_uploader(
+                "CAS PDF", type=["pdf"], disabled=disabled,
+                help="The password-protected PDF from CAMS / KFintech.",
+            )
+            password = st.text_input(
+                "CAS PDF password", type="password", disabled=disabled,
+                help="PAN (CAPS) + DOB (DDMMYYYY), e.g. ABCDE1234F01011990",
+            )
+            submit = st.form_submit_button(
+                "Upload & parse", type="primary", use_container_width=True,
+                disabled=disabled,
+            )
+
+        if not submit:
+            return
+        if uploaded is None:
+            st.error("Attach a CAS PDF first.")
+            return
+        pdf_bytes = uploaded.getvalue()
+        if not password:
+            st.error("Enter the PDF password.")
+            return
+        if not _pdf_password_ok(pdf_bytes, password):
+            st.error(
+                "That password didn't unlock the PDF. "
+                "Format: PAN (CAPS) + DOB (DDMMYYYY) — e.g. ABCDE1234F01011990."
+            )
+            return
+
+        # Persist the working password so future parses (and the rest of the
+        # dashboard) keep unlocking this PDF without re-asking.
+        if session is not None:
+            auth.update_account_creds(session, slug, pdf_password=password)
+            ctx.pdf_password = password
+
+        with st.spinner("Saving & parsing the statement (one-time, ~90s)…"):
+            out_path = _save_uploaded_cas(ctx, slug, uploaded.name, pdf_bytes)
+            from analytics.portfolio import parse_cas
+            parse_cas(ctx, force=True)
+        reset_caches()
+        st.success(f"✅ Uploaded CAS: {out_path.name}")
+        st.rerun()
+
+
 def render_cas_workflow(
     ctx: AccountContext,
     slug: str,
     enc_pdf: Path | None,
     reset_caches: Callable[[], None],
+    session: "auth.Session | None" = None,
 ) -> None:
     state = load_state(slug)
     demo = is_demo_slug(slug)
@@ -227,6 +344,8 @@ def render_cas_workflow(
             _demo_process_inbox_button(slug, reset_caches)
         else:
             _process_inbox_button(ctx, slug, state, enc_pdf, reset_caches)
+
+    _render_upload_expander(ctx, slug, session, reset_caches, disabled=demo)
 
     st.caption("Re-fetch today's NAV from AMFI and recompute valuations (fast — skips PDF parser).")
     if st.button("📊 Re-parse current PDF with latest NAV", use_container_width=True):

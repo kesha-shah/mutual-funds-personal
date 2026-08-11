@@ -11,3 +11,4 @@ debug/
 data/
 .claude/
 *.pkl
+logs/

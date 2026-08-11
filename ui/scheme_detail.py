@@ -30,24 +30,62 @@ def fy_realized_equity_ltcg(all_rows: list[SchemeRow]) -> tuple[float, date, dat
     return total, fy_start, fy_end
 
 
+ALL_FOLIOS = "All folios (combined)"
+
+
+def _folio_label(f) -> str:
+    return f"{f.folio} · {f.holder_name or '—'}"
+
+
 def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> None:
-    """Inline LTCG/STCG split for a hypothetical redemption — FIFO across all
-    folios of this scheme."""
+    """Inline LTCG/STCG split for a hypothetical redemption.
+
+    A real redemption is placed against one folio, and the AMC applies FIFO
+    *within that folio* — so the folio picker isn't cosmetic: the lot set (and
+    therefore the LTCG/STCG split) genuinely differs per folio.
+    """
     st.markdown("### 💰 Redemption gain breakdown")
 
-    all_tx: list[dict] = []
-    for f in r.folio_details:
-        all_tx.extend(f.transactions)
-    open_lots = build_open_lots(all_tx)
+    scheme_key = r.isin or r.scheme
+
+    # --- Scope: which folio are we redeeming from? -------------------------
+    by_label = {_folio_label(f): f for f in r.folio_details}
+    if len(r.folio_details) > 1:
+        scope = st.selectbox(
+            "Redeem from",
+            options=[ALL_FOLIOS] + list(by_label),
+            key=f"redeem_folio_{scheme_key}",
+            help="Redemptions are placed per folio and the AMC runs FIFO within "
+                 "that folio, so the tax split differs by folio. Pick the folio "
+                 "you'll actually redeem from.",
+        )
+    else:
+        scope = ALL_FOLIOS
+
+    # A stale session value (folio renamed between reruns) falls back to "all".
+    sel_folio = by_label.get(scope)
+    if sel_folio is None:
+        scope, scope_tx = ALL_FOLIOS, [t for f in r.folio_details for t in f.transactions]
+    else:
+        scope_tx = sel_folio.transactions
+    # Widget state is per (scheme, folio) so switching folios re-derives the
+    # smart default instead of carrying over an amount the folio can't cover.
+    scope_key = f"{scheme_key}_{sel_folio.folio if sel_folio else 'ALL'}"
+
+    open_lots = build_open_lots(scope_tx)
     available_units = sum(l.units for l in open_lots)
 
-    if available_units <= 0 or r.nav <= 0:
-        st.info("No open units to redeem (or NAV unavailable).")
+    if r.nav <= 0:
+        st.info("NAV unavailable — can't value a redemption right now.")
+        return
+    if available_units <= 0:
+        st.info("No open units to redeem in this folio.")
         return
 
     available_value = available_units * r.nav
 
     # Long-term threshold differs: equity = 12 months, debt = 24 months.
+    # Keyed on the scheme, not the folio — it's a property of the fund.
     default_treat = "Equity" if r.type in ("EQUITY", "MULTI_ASSET") else "Debt"
     treat_options = ["Equity", "Debt"]
     treat_choice = st.radio(
@@ -55,7 +93,7 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
         options=treat_options,
         index=treat_options.index(default_treat),
         horizontal=True,
-        key=f"tax_treat_{r.isin or r.scheme}",
+        key=f"tax_treat_{scheme_key}",
         help="Equity = 12 months, Debt = 24 months. Pick based on the fund's "
              "actual equity composition (≥65% Indian equity → Equity).",
     )
@@ -81,7 +119,7 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
 
     # Pre-fill the widget with the smart default only the first time it
     # renders; afterwards the user's own edits win (widget state persists).
-    amount_key = f"redeem_amt_{r.isin or r.scheme}"
+    amount_key = f"redeem_amt_{scope_key}"
     if amount_key not in st.session_state:
         st.session_state[amount_key] = default_amount
 
@@ -97,7 +135,10 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
             help=f"Max: {fmt_inr(available_value)} ({available_units:,.4f} units @ ₹{r.nav:,.4f})",
         )
     with cols[1]:
-        st.metric("Available", fmt_inr(available_value))
+        st.metric(
+            "Available" if scope == ALL_FOLIOS else "Available in folio",
+            fmt_inr(available_value),
+        )
 
     # One-line note about why the box is pre-filled the way it is.
     if is_equity and ltcg_room > 0:
@@ -105,9 +146,10 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
             full_holding_ltcg = simulate_redemption(
                 open_lots, available_units, r.nav, is_equity=True
             ).bucket_gain.get(EQ_LTCG, 0.0)
+            holding_word = "holding" if scope == ALL_FOLIOS else "folio"
             if full_holding_ltcg <= ltcg_room:
                 st.caption(
-                    f"💡 Pre-filled with your entire holding — redeeming it all yields "
+                    f"💡 Pre-filled with your entire {holding_word} — redeeming it all yields "
                     f"only {fmt_inr(full_holding_ltcg)} LTCG, within your {fmt_inr(ltcg_room)} room."
                 )
             else:
@@ -173,6 +215,9 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
                 f"already used {fmt_inr(realized)} across all your equity funds this FY."
             )
 
+    if len(r.folio_details) > 1:
+        _render_folio_comparison(r, is_equity, ltcg_room)
+
     with st.expander(f"📋 Lot-by-lot breakdown ({len(res.breakdown)} lots)", expanded=False):
         lot_rows = [{
             "Purchase date": b.lot_date,
@@ -194,6 +239,64 @@ def _render_redemption_calculator(r: SchemeRow, all_rows: list[SchemeRow]) -> No
                 .map(color_signed, subset=["Gain"])
             )
             st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _render_folio_comparison(r: SchemeRow, is_equity: bool, ltcg_room: float) -> None:
+    """Side-by-side 'if I emptied this folio' tax picture, so the user can see
+    which folio is the cheapest one to redeem from before placing the order."""
+    rows = []
+    for f in r.folio_details:
+        lots = build_open_lots(f.transactions)
+        units = sum(l.units for l in lots)
+        if units <= 0:
+            continue
+        res = simulate_redemption(lots, units, r.nav, is_equity=is_equity)
+        ltcg = res.bucket_gain.get(EQ_LTCG, 0.0) + res.bucket_gain.get(DEBT_LTCG, 0.0)
+        stcg = res.bucket_gain.get(EQ_STCG, 0.0) + res.bucket_gain.get(DEBT_SLAB, 0.0)
+        rows.append({
+            "Folio": f.folio,
+            "Name": f.holder_name or "—",
+            "Units": units,
+            "Value": units * r.nav,
+            "LTCG if fully redeemed": ltcg,
+            "STCG if fully redeemed": stcg,
+            "Tax-free harvest": (
+                min(
+                    redemption_amount_for_target_ltcg(lots, r.nav, ltcg_room, is_equity=True),
+                    units * r.nav,
+                )
+                if is_equity and ltcg_room > 0
+                else None
+            ),
+        })
+
+    if not rows:
+        return
+
+    with st.expander(f"⚖️ Compare folios ({len(rows)})", expanded=False):
+        cdf = pd.DataFrame(rows)
+        if cdf["Tax-free harvest"].isna().all():
+            cdf = cdf.drop(columns=["Tax-free harvest"])
+        money = [c for c in cdf.columns if c not in ("Folio", "Name", "Units")]
+        styled = (
+            cdf.style
+            .format({
+                **{c: (lambda v: "—" if pd.isna(v) else fmt_inr(v)) for c in money},
+                "Units": "{:,.4f}",
+            })
+            .map(color_signed, subset=["LTCG if fully redeemed", "STCG if fully redeemed"])
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.caption(
+            "Each row assumes you empty *that folio alone* — FIFO restarts per "
+            "folio, which is why the split differs."
+            + (
+                "  \n⚠️ The tax-free room is shared across every folio and scheme, "
+                "so these harvest amounts are alternatives, not a total you can add up."
+                if is_equity and ltcg_room > 0
+                else ""
+            )
+        )
 
 
 def _render_folios_table(r: SchemeRow) -> None:

@@ -382,7 +382,7 @@ def main() -> None:
             st.info("No CAS yet for this account. Use the buttons below to fetch one.")
 
         st.divider()
-        render_cas_workflow(ctx, slug, enc_pdf, _reset_caches)
+        render_cas_workflow(ctx, slug, enc_pdf, _reset_caches, session=session)
 
     if pdf_password_mismatch:
         _render_pdf_mismatch_recovery(ctx)
