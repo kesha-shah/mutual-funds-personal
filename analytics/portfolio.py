@@ -220,12 +220,17 @@ def _normalize_transactions(scheme: dict) -> list[dict]:
 def to_scheme_rows(
     cas: dict,
     nav_lookup: dict[str, tuple[float, date]] | None = None,
+    amc_lookup: dict[str, str] | None = None,
 ) -> list[SchemeRow]:
     """Group by (scheme name, ISIN) so multiple folios in the same scheme/plan
     collapse to a single row. Direct vs Regular have different ISINs and stay
     separate. If nav_lookup is provided (ISIN → (NAV, date)), each scheme's
     current value is recalculated from its unit balance × latest NAV — gives
-    XIRR a fresh terminal cashflow that matches what brokers show today."""
+    XIRR a fresh terminal cashflow that matches what brokers show today.
+    amc_lookup (ISIN → AMC, from AMFI) overrides the CAS's AMC when known:
+    casparser only picks up an AMC heading ending in "MF"/"Mutual Fund", so
+    houses printed otherwise (e.g. "Zerodha Fund House") inherit the previous
+    AMC's name and would otherwise show up under the wrong one."""
     grouped: dict[tuple[str, str], list[tuple[str, str, dict]]] = {}
     for folio in cas.get("folios", []) or []:
         amc = folio.get("amc") or ""
@@ -235,11 +240,12 @@ def to_scheme_rows(
             grouped.setdefault(key, []).append((amc, folio_no, s))
 
     nav_lookup = nav_lookup or {}
+    amc_lookup = amc_lookup or {}
     folio_names = cas.get("_folio_names") or {}
     rows: list[SchemeRow] = []
     for (scheme_name, isin), entries in grouped.items():
         type_str = "OTHER"
-        amc = entries[0][0]
+        amc = amc_lookup.get(isin) or entries[0][0]
         folio_entries: list[FolioEntry] = []
 
         for amc_x, folio_no, s in entries:

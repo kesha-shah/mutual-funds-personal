@@ -23,7 +23,7 @@ import streamlit as st  # noqa: E402
 
 from analytics.accounts import AccountContext, account_context  # noqa: E402
 from analytics.demo import is_demo_slug  # noqa: E402
-from analytics.nav import get_latest_nav  # noqa: E402
+from analytics.nav import get_amc_by_isin, get_latest_nav  # noqa: E402
 from analytics.portfolio import (  # noqa: E402
     SchemeRow, combined_xirr, filter_rows, latest_pdf_enc, parse_cas, to_scheme_rows,
 )
@@ -58,12 +58,22 @@ def cached_nav():
         return {}
 
 
+@st.cache_data(show_spinner=False)
+def cached_amc_map():
+    """ISIN → AMC from AMFI. Empty on failure — rows then keep the CAS's
+    (occasionally wrong) AMC rather than losing the AMC filter entirely."""
+    try:
+        return get_amc_by_isin()
+    except Exception:
+        return {}
+
+
 @st.cache_data(show_spinner="Parsing CAS PDF…")
 def cached_load(slug: str, _ctx: AccountContext) -> tuple[list[SchemeRow], str, str]:
     """Cache key is slug only (Streamlit's leading-underscore convention tells
     it to skip hashing _ctx — its data_key bytes don't survive logout anyway)."""
     cas = parse_cas(_ctx)
-    rows = to_scheme_rows(cas, nav_lookup=cached_nav())
+    rows = to_scheme_rows(cas, nav_lookup=cached_nav(), amc_lookup=cached_amc_map())
     investor = (cas.get("investor_info") or {}).get("name") or "—"
     period_to = (cas.get("statement_period") or {}).get("to") or "—"
     return rows, investor, str(period_to)
@@ -74,6 +84,7 @@ def _reset_caches() -> None:
     settings save, fresh PDF arrival, dev re-parse, etc."""
     cached_load.clear()
     cached_nav.clear()
+    cached_amc_map.clear()
 
 
 # ---------------------------------------------------------------------------
