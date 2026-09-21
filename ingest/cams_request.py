@@ -45,61 +45,114 @@ def _form_date(d: date) -> str:
     return d.strftime("%d-%b-%Y")
 
 
-def dismiss_disclaimer(page: Page) -> None:
-    """CAMS shows a Disclaimer modal on first visit (no cookies set):
-    select the ACCEPT radio, then click PROCEED."""
-    try:
-        page.wait_for_selector("text=Disclaimer", timeout=5000)
-    except PWTimeout:
-        return
-
-    print("-> Disclaimer modal detected; accepting")
-    page.locator(
-        'mat-radio-button:has(input[value="ACCEPT"]) .mat-radio-container'
-    ).click()
-    page.wait_for_timeout(300)
-    page.get_by_role("button", name="PROCEED").click()
-    try:
-        page.wait_for_selector("text=Disclaimer", state="hidden", timeout=5000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(500)
+# The CAMS form hides behind up to three overlays on a cold visit: a ConsenPro
+# cookie banner, an optional Disclaimer modal, and a rotating "<AMC> Mutual Fund
+# is now live!" promo dialog. CAMS adds and drops these without notice, so every
+# dismissal here is best-effort and must never raise — an overlay that isn't
+# there is the normal case, not a failure.
 
 
-def dismiss_promo(page: Page) -> None:
-    """CAMS *sometimes* shows a promotional mat-dialog after the Disclaimer
-    (e.g. "AlphaGrep Mutual Fund is now live!") that overlays the form. Close it
-    if present. This is entirely best-effort: if no popup appears (CAMS drops it,
-    or it doesn't show on a given visit) we return quickly, and the rest of the
-    flow proceeds unchanged. Never raises."""
-    dialog = page.locator("mat-dialog-container")
-    try:
-        dialog.first.wait_for(state="visible", timeout=4000)
-    except PWTimeout:
-        return  # no popup this visit -> nothing to do
-    print("-> promo popup detected; closing")
-    for sel in (
-        "mat-dialog-container mat-icon.close-popup",
-        "mat-dialog-container .closeicon",
-        "mat-dialog-container [aria-label='Close']",
-        "mat-dialog-container button.mat-dialog-close",
-    ):
+def _click_first(page: Page, selectors, timeout: int = 1500) -> bool:
+    for sel in selectors:
         try:
-            page.locator(sel).first.click(timeout=1500)
-            break
+            page.locator(sel).first.click(timeout=timeout)
+            return True
         except Exception:
             continue
-    # If a close control wasn't found/worked, Escape dismisses a mat-dialog too.
+    return False
+
+
+# The Disclaimer and the promo are the same Angular component (app-camsterms)
+# in the same container class, so they're told apart by the ACCEPT radio that
+# only the Disclaimer has. Matching on the *word* "Disclaimer" does not work:
+# the page footer links to "Disclaimer & Terms of Use", so a text match hits
+# even when no modal is open — we'd then hunt for an ACCEPT radio that isn't
+# there and die on its click timeout.
+DISCLAIMER_DIALOG = 'mat-dialog-container:has(input[value="ACCEPT"])'
+PROMO_DIALOG = 'mat-dialog-container:not(:has(input[value="ACCEPT"]))'
+
+
+def dismiss_cookie_banner(page: Page, timeout: int = 3000) -> None:
+    """ConsenPro cookie banner (#cc-main), bottom-right. "Essential only" is
+    enough to dismiss it and keeps us out of the analytics cookie buckets."""
+    banner = page.locator("#cc-main .cm").first
     try:
-        if dialog.first.is_visible():
+        banner.wait_for(state="visible", timeout=timeout)
+    except PWTimeout:
+        return
+    print("-> cookie banner detected; accepting essential only")
+    _click_first(page, (
+        '#cc-main button.cm__btn[data-role="necessary"]',
+        '#cc-main button.cm__btn[data-role="all"]',
+    ))
+    try:
+        banner.wait_for(state="hidden", timeout=4000)
+    except PWTimeout:
+        print("   warning: cookie banner still showing; continuing anyway")
+
+
+def dismiss_disclaimer(page: Page, timeout: int = 3000) -> None:
+    """Disclaimer modal (shown when no consent cookie is set): select the
+    ACCEPT radio, then click PROCEED."""
+    dialog = page.locator(DISCLAIMER_DIALOG).first
+    try:
+        dialog.wait_for(state="visible", timeout=timeout)
+    except PWTimeout:
+        return
+    print("-> Disclaimer modal detected; accepting")
+    _click_first(page, (
+        f'{DISCLAIMER_DIALOG} mat-radio-button:has(input[value="ACCEPT"]) .mat-radio-container',
+        f'{DISCLAIMER_DIALOG} mat-radio-button:has(input[value="ACCEPT"])',
+    ))
+    page.wait_for_timeout(300)
+    _click_first(page, (f'{DISCLAIMER_DIALOG} button:has-text("PROCEED")',), timeout=3000)
+    try:
+        dialog.wait_for(state="hidden", timeout=5000)
+    except PWTimeout:
+        print("   warning: Disclaimer modal still showing; continuing anyway")
+
+
+def dismiss_promo(page: Page, timeout: int = 3000) -> None:
+    """Close the promo dialog (e.g. "ASK Mutual Fund is now live!") — a banner
+    image with one close icon and no accept/decline. Its modal backdrop
+    swallows clicks on the form underneath, so this has to go before we touch
+    any field."""
+    dialog = page.locator(PROMO_DIALOG).first
+    try:
+        dialog.wait_for(state="visible", timeout=timeout)
+    except PWTimeout:
+        return
+    print("-> promo popup detected; closing")
+    _click_first(page, (
+        f"{PROMO_DIALOG} mat-icon.close-popup",
+        f"{PROMO_DIALOG} .closeicon",
+        f"{PROMO_DIALOG} .close-icon",
+        f"{PROMO_DIALOG} [aria-label='Close']",
+    ))
+    # If no close control matched, Escape dismisses a mat-dialog too.
+    try:
+        if dialog.is_visible():
             page.keyboard.press("Escape")
     except Exception:
         pass
     try:
-        dialog.first.wait_for(state="hidden", timeout=4000)
+        dialog.wait_for(state="hidden", timeout=4000)
     except PWTimeout:
         print("   warning: promo popup may still be open; continuing anyway")
-    page.wait_for_timeout(300)
+
+
+def clear_overlays(page: Page, rounds: int = 3, timeout: int = 3000) -> None:
+    """Clear whatever is covering the form, in whatever order CAMS stacked it.
+    Loops because closing one overlay can reveal the next, and returns as soon
+    as no dialog is left so a clean page costs one pass, not `rounds`."""
+    for _ in range(rounds):
+        dismiss_cookie_banner(page, timeout=timeout)
+        dismiss_disclaimer(page, timeout=timeout)
+        dismiss_promo(page, timeout=timeout)
+        page.wait_for_timeout(400)
+        dialogs = page.locator("mat-dialog-container")
+        if not dialogs.count() or not dialogs.first.is_visible():
+            return
 
 
 def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> None:
@@ -112,8 +165,7 @@ def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> Non
     page.goto(CAS_URL, wait_until="networkidle")
     dump_debug(page, "01_loaded")
 
-    dismiss_disclaimer(page)
-    dismiss_promo(page)
+    clear_overlays(page)
     dump_debug(page, "02_after_cookie")
 
     for sel in ["button[aria-label='Close']", ".close-chat", "#chat-close"]:
@@ -210,6 +262,10 @@ def submit_cas_request(page: Page, ctx: AccountContext, *, dry_run: bool) -> Non
     print("-> filling password (twice)")
     page.locator("#password").fill(pdf_password)
     page.locator("#confirmPassword").fill(pdf_password)
+
+    # A promo dialog can land late, after the form is already filled; its
+    # backdrop would eat the Submit click. Re-check with short timeouts.
+    clear_overlays(page, rounds=2, timeout=800)
 
     dump_debug(page, "before_submit")
 
