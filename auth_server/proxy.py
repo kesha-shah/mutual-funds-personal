@@ -35,6 +35,20 @@ _HOP_BY_HOP = {
 }
 
 
+# Streamlit ships no web manifest, so browsers only offer "Add shortcut". Inject
+# the PWA tags into its HTML shell so the dashboard is installable as an app.
+# PWA_NAME lets a second install (e.g. run_local.sh) show up under its own name.
+PWA_NAME = os.environ.get("PWA_NAME", "MF Portfolio")
+PWA_HEAD = f"""<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0e1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="{PWA_NAME}">
+<link rel="apple-touch-icon" href="/_auth/static/pwa/apple-touch-icon.png">
+<script>if("serviceWorker" in navigator)navigator.serviceWorker.register("/sw.js");</script>
+</head>""".encode()
+
+
 def _drop_hop_by_hop(headers: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
@@ -64,8 +78,11 @@ async def proxy_http(request: Request, payload: str) -> Response:
     # Length correctly from our actual payload.
     response_headers.pop("content-encoding", None)
     response_headers.pop("content-length", None)
+    content = upstream.content
+    if upstream.headers.get("content-type", "").startswith("text/html"):
+        content = content.replace(b"</head>", PWA_HEAD, 1)
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
         headers=response_headers,
         media_type=upstream.headers.get("content-type"),

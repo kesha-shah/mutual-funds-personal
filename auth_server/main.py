@@ -20,10 +20,12 @@ without ever seeing the user's KEK or password.
 """
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -33,6 +35,7 @@ from auth_server import account, proxy, sessions
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
+TEMPLATES.env.globals["pwa_name"] = proxy.PWA_NAME
 
 app = FastAPI(title="MF Portfolio — Auth Gateway")
 app.mount("/_auth/static", StaticFiles(directory=str(ROOT / "static")), name="static")
@@ -125,6 +128,22 @@ def _next_screen(request: Request) -> str | None:
 # ---------------------------------------------------------------------------
 # Public routes
 # ---------------------------------------------------------------------------
+
+# PWA assets — public so the browser can fetch them before login. The service
+# worker must be served from the root to control the whole site.
+@app.get("/manifest.webmanifest")
+def pwa_manifest():
+    manifest = json.loads((ROOT / "static" / "pwa" / "manifest.webmanifest").read_text())
+    manifest["name"] = manifest["short_name"] = proxy.PWA_NAME
+    return JSONResponse(manifest, media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+def pwa_service_worker():
+    return FileResponse(ROOT / "static" / "pwa" / "sw.js",
+                        media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
+
 
 @app.get("/login", response_class=HTMLResponse)
 def login_get(request: Request):
